@@ -12,15 +12,8 @@ from sklearn.metrics.pairwise import cosine_similarity
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-
-try:
-    from webdriver_manager.chrome import ChromeDriverManager
-    USE_WDM = True
-except Exception:
-    USE_WDM = False
 
 try:
     from zoneinfo import ZoneInfo
@@ -153,7 +146,7 @@ def tokenize(text: str):
 
 
 # =========================
-# Selenium
+# Selenium (✅ webdriver_manager 사용 안함)
 # =========================
 def make_driver(headless: bool = True) -> webdriver.Chrome:
     opts = Options()
@@ -166,32 +159,18 @@ def make_driver(headless: bool = True) -> webdriver.Chrome:
     if headless:
         opts.add_argument("--headless=new")
 
+    # Render/리눅스에서 안정성
+    opts.add_argument("--remote-debugging-port=9222")
+
     # 이미지 차단
     opts.add_experimental_option("prefs", {
         "profile.managed_default_content_settings.images": 2,
         "profile.default_content_setting_values.notifications": 2,
     })
 
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-    opts.add_experimental_option("useAutomationExtension", False)
-
-    if USE_WDM:
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=opts)
-    else:
-        driver = webdriver.Chrome(options=opts)
-
+    # ✅ 핵심: Selenium Manager가 맞는 드라이버를 자동으로 잡음
+    driver = webdriver.Chrome(options=opts)
     driver.implicitly_wait(0.3)
-
-    try:
-        driver.execute_cdp_cmd(
-            "Page.addScriptToEvaluateOnNewDocument",
-            {"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"}
-        )
-    except Exception:
-        pass
-
     return driver
 
 
@@ -295,7 +274,7 @@ def get_article_datetime_strict(driver, href: str, pause: float = 0.05):
 
 
 # =========================
-# 진행/중지/디버그를 위한 "쪼개기(스텝 실행)" 상태머신
+# 진행/중지/디버그 상태
 # =========================
 def log(msg: str):
     st.session_state.logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
@@ -303,35 +282,22 @@ def log(msg: str):
 
 def ensure_state():
     ss = st.session_state
-    if "running" not in ss:
-        ss.running = False
-    if "phase" not in ss:
-        ss.phase = "idle"  # idle | collect | validate | done
-    if "driver" not in ss:
-        ss.driver = None
-    if "logs" not in ss:
-        ss.logs = []
-    if "candidates" not in ss:
-        ss.candidates = {}
-    if "collected" not in ss:
-        ss.collected = {}
-    if "page" not in ss:
-        ss.page = 1
-    if "no_match_pages" not in ss:
-        ss.no_match_pages = 0
-    if "validate_keys" not in ss:
-        ss.validate_keys = []
-    if "validate_i" not in ss:
-        ss.validate_i = 0
-    if "last_url" not in ss:
-        ss.last_url = ""
-    if "posts" not in ss:
-        ss.posts = []
+    ss.setdefault("running", False)
+    ss.setdefault("phase", "idle")  # idle | collect | validate | done
+    ss.setdefault("driver", None)
+    ss.setdefault("logs", [])
+    ss.setdefault("candidates", {})
+    ss.setdefault("collected", {})
+    ss.setdefault("page", 1)
+    ss.setdefault("no_match_pages", 0)
+    ss.setdefault("validate_keys", [])
+    ss.setdefault("validate_i", 0)
+    ss.setdefault("last_url", "")
+    ss.setdefault("posts", [])
 
 
 def reset_job():
     ss = st.session_state
-    # 드라이버 정리
     try:
         if ss.driver is not None:
             ss.driver.quit()
@@ -368,8 +334,7 @@ def start_job(target_date: date_cls, headless: bool, max_pages: int, stop_no_mat
 
 
 def stop_job():
-    ss = st.session_state
-    ss.running = False
+    st.session_state.running = False
     log("중지(사용자 요청)")
 
 
@@ -387,9 +352,6 @@ def finalize_job():
 
 
 def step_collect():
-    """
-    한 번 실행에서 '페이지 몇 개'만 처리 (UI 멈춤 방지)
-    """
     ss = st.session_state
     d = ss.driver
 
@@ -398,14 +360,14 @@ def step_collect():
     target_dot = ss.target_date.strftime("%Y.%m.%d")
     target_iso = ss.target_date.strftime("%Y-%m-%d")
 
-    # 이번 스텝에서 처리할 페이지 수 (고정)
     pages_per_step = int(ss.pages_per_step)
-
     processed = 0
+
     while ss.page <= ss.max_pages and processed < pages_per_step and ss.running:
         url = build_page_url(ss.page)
         ss.last_url = url
         log(f"[목록] page={ss.page}")
+
         try:
             d.get(url)
             wait_list_loaded(d)
@@ -428,6 +390,7 @@ def step_collect():
                     links = row.find_elements(By.CSS_SELECTOR, LINK_CSS)
                     if not links:
                         continue
+
                     a = links[0]
                     href = clean(a.get_attribute("href"))
                     if not href:
@@ -478,7 +441,6 @@ def step_collect():
             else:
                 ss.no_match_pages = 0
 
-            # 조기 종료 조건
             if ss.no_match_pages >= ss.stop_no_match_pages:
                 log("목록 조기 종료(연속 0페이지)")
                 ss.page = ss.max_pages + 1
@@ -490,7 +452,6 @@ def step_collect():
         ss.page += 1
         processed += 1
 
-    # 목록이 끝나면 validate로 전환
     if ss.page > ss.max_pages or ss.no_match_pages >= ss.stop_no_match_pages:
         ss.validate_keys = list(ss.candidates.keys())
         ss.validate_i = 0
@@ -499,15 +460,12 @@ def step_collect():
 
 
 def step_validate():
-    """
-    한 번 실행에서 '게시글 몇 개'만 상세 검증
-    """
     ss = st.session_state
     d = ss.driver
 
     per_step = int(ss.articles_per_step)
-
     processed = 0
+
     while ss.validate_i < len(ss.validate_keys) and processed < per_step and ss.running:
         href = ss.validate_keys[ss.validate_i]
         ss.last_url = href
@@ -515,7 +473,7 @@ def step_validate():
         try:
             dt = get_article_datetime_strict(d, href, pause=ss.pause)
 
-            # 못읽으면 버림 (섞임 방지)
+            # 못 읽으면 버림(섞임 방지)
             if dt and dt.date() == ss.target_date:
                 base = ss.candidates[href]
                 out = dict(base)
@@ -629,7 +587,7 @@ with st.expander("설정", expanded=True):
     with c7:
         articles_per_step = st.number_input("한 번에 상세 글 검증", min_value=1, max_value=30, value=10, step=1)
     with c8:
-        auto_run = st.checkbox("자동 진행(켜면 알아서 계속)", value=True)
+        auto_run = st.checkbox("자동 진행(켜면 계속)", value=True)
 
     st.session_state.pages_per_step = int(pages_per_step)
     st.session_state.articles_per_step = int(articles_per_step)
@@ -667,19 +625,14 @@ status = st.empty()
 pbar1 = st.progress(0)
 pbar2 = st.progress(0)
 
-# 진행률 계산
 if phase in ("collect", "validate", "done"):
-    # 1) 목록 단계 진행률
-    maxp = max(1, int(st.session_state.max_pages) if "max_pages" in st.session_state else int(max_pages))
+    maxp = max(1, int(st.session_state.get("max_pages", int(max_pages))))
     curp = min(maxp, max(1, int(st.session_state.page)))
-    p1 = min(1.0, curp / maxp)
-    pbar1.progress(int(p1 * 100))
+    pbar1.progress(int(min(1.0, curp / maxp) * 100))
 
-    # 2) 상세 검증 단계 진행률
     total = max(1, len(st.session_state.validate_keys))
     done = min(total, int(st.session_state.validate_i))
-    p2 = min(1.0, done / total)
-    pbar2.progress(int(p2 * 100))
+    pbar2.progress(int(min(1.0, done / total) * 100))
 
 if phase == "idle":
     status.info("대기 중. ▶ 시작을 눌러줘.")
@@ -696,13 +649,12 @@ elif phase == "validate":
 elif phase == "done":
     status.success(f"완료! 선택한 날짜 글만 {len(st.session_state.posts)}개")
 
-# 디버그 로그
 if debug:
-    st.caption("DEBUG LOG")
+    st.caption("DEBUG LOG (최근 200줄)")
     st.code("\n".join(st.session_state.logs[-200:]) if st.session_state.logs else "(로그 없음)")
     st.caption(f"last_url = {st.session_state.last_url}")
 
-# 실제 작업 스텝 실행
+# 작업 스텝 실행
 if running and phase in ("collect", "validate"):
     try:
         if phase == "collect":
@@ -713,9 +665,8 @@ if running and phase in ("collect", "validate"):
         log(f"치명 오류: {type(e).__name__}: {e}")
         st.session_state.running = False
 
-    # 자동 진행이면 계속 rerun
     if auto_run and st.session_state.running and st.session_state.phase in ("collect", "validate"):
-        time.sleep(0.15)  # UI 숨 쉴 틈
+        time.sleep(0.15)
         st.rerun()
 
 # 결과 표시
