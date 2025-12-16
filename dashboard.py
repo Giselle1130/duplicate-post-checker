@@ -1,20 +1,15 @@
-import os
 import re
 import time
-import traceback
 from datetime import datetime, date as date_cls
+from urllib.parse import urljoin
 
+import requests
 import pandas as pd
 import streamlit as st
+from bs4 import BeautifulSoup
 
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.support.ui import WebDriverWait
 
 try:
     from zoneinfo import ZoneInfo
@@ -23,483 +18,378 @@ except Exception:
     KST = None
 
 
-# =========================
-# 대상 게시판 고정
-# =========================
+# =====================
+# 게시판 고정
+# =====================
 CLUB_ID = 28866679
 MENU_ID = 178
+BASE_URL = f"https://cafe.naver.com/f-e/cafes/{CLUB_ID}/menus/{MENU_ID}?viewType=L&page="
 
-# ✅ 안정적인 "클래식 목록"으로 진입
-BASE_LIST_URL = (
-    "https://cafe.naver.com/ArticleList.nhn"
-    f"?search.clubid={CLUB_ID}"
-    f"&search.menuid={MENU_ID}"
-    "&search.boardtype=L"
-)
-
-# 링크는 케이스가 섞여서 둘 다 지원:
-ARTICLEID_RE = re.compile(r"(?:[?&]articleid=(\d+))|(?:/articles/(\d+))")
-
-# 목록에서 글 링크를 찾는 CSS (둘 다)
-LINK_CSS = "a[href*='articleid='], a[href*='/articles/']"
-
-
-# =========================
-# 유틸
-# =========================
-def clean(x: str) -> str:
-    return (x or "").replace("\u200b", "").strip()
-
-
-def kst_today() -> date_cls:
-    if KST is None:
-        return datetime.now().date()
-    return datetime.now(KST).date()
-
-
-def is_time_token(s: str) -> bool:
-    return re.fullmatch(r"\d{1,2}:\d{2}", (s or "").strip()) is not None
-
-
-def extract_time_token(text: str) -> str:
-    m = re.search(r"\b(\d{1,2}:\d{2})\b", clean(text))
-    return m.group(1) if m else ""
-
-
-def extract_date_token(text: str) -> str:
-    m = re.search(r"\b(20\d{2}\.\d{2}\.\d{2})\.?\b", clean(text))
-    return m.group(1) if m else ""
-
-
-def parse_dot_date(s: str):
-    try:
-        return datetime.strptime(s, "%Y.%m.%d").date()
-    except Exception:
-        return None
-
-
-def build_page_url(page: int) -> str:
-    return f"{BASE_LIST_URL}&search.page={page}"
-
-
-# =========================
-# 제목 정규화/토큰
-# =========================
-STOPWORDS = {
-    "steam", "kakao", "paragon", "pubg",
-    "클랜", "클랜원", "모집", "환영", "가입",
-    "디스코드", "discord", "서버",
-    "초보", "신생", "친목", "경쟁", "직장인",
-    "일반", "랭크", "랭겜", "스쿼드", "듀오", "솔로",
-    "내전", "자유", "이벤트", "안내", "공지",
+HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept-Language": "ko-KR,ko;q=0.9",
 }
 
 
-def normalize_title(raw: str) -> str:
-    t = clean(raw)
+# =====================
+# 날짜 판별 (목록 기준)
+# =====================
+def is_target_date(date_text: str, target_date: date_cls) -> bool:
+    """
+    KST 기준:
+    - 선택 날짜가 오늘이면: 'HH:MM' 형태만 수집
+    - 그 외(과거 날짜)이면: 'YYYY.MM.DD' 정확히 일치만 수집
+    """
+    today_kst = datetime.now(KST).date() if KST else datetime.now().date()
 
-    # 끝 댓글수 제거
-    t = re.sub(r"\s*\[\s*\d+\s*\]\s*$", "", t)
-    t = re.sub(r"\s*\(\s*\d+\s*\)\s*$", "", t)
+    if target_date == today_kst:
+        return bool(re.match(r"^\d{1,2}:\d{2}$", date_text))
 
-    # [Steam] 같은 태그 제거
-    t = re.sub(r"\[[^\]]{1,30}\]", " ", t)
-
-    # LV / 나이/범위 패턴 제거
-    t = re.sub(r"\bLv\.?\s*\d+\b", " ", t, flags=re.IGNORECASE)
-    t = re.sub(r"\b\d{1,2}\s*~\s*\d{1,2}\b", " ", t)
-    t = re.sub(r"\b\d{1,2}\s*세\b", " ", t)
-
-    # url 제거
-    t = re.sub(r"https?://\S+", " ", t)
-
-    # 이모지/기호 제거 (한/영/숫자/공백만 유지)
-    t = re.sub(r"[^0-9A-Za-z가-힣\s]", " ", t)
-
-    # 숫자 단독 제거
-    t = re.sub(r"\b\d+\b", " ", t)
-
-    # 공백 정리
-    t = re.sub(r"\s+", " ", t).strip().lower()
-    return t
+    return date_text == target_date.strftime("%Y.%m.%d")
 
 
-def tokenize(text: str):
-    t = normalize_title(text)
-    toks = re.findall(r"[a-z]+|[가-힣]+", t)
-    toks = [x for x in toks if len(x) >= 2]
-    toks = [x for x in toks if x not in STOPWORDS]
-    return toks
+# =====================
+# 텍스트 정규화
+# =====================
+def norm(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
 
 
-# =========================
-# Selenium (✅ Render/Docker 호환: chromium/chromedriver 경로 고정)
-# =========================
-def _detect_chromium_binary() -> str:
-    candidates = ["/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome"]
-    for p in candidates:
-        if os.path.exists(p):
-            return p
-    return ""
+def normalize_title(s: str) -> str:
+    s = norm(s).lower()
+    s = re.sub(r"[^\w가-힣 ]+", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 
-def make_driver(headless: bool = True) -> webdriver.Chrome:
-    opts = Options()
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--window-size=1400,900")
-    opts.page_load_strategy = "eager"
-
-    if headless:
-        opts.add_argument("--headless=new")
-
-    # ✅ Docker에 설치된 chromium 사용
-    bin_path = _detect_chromium_binary()
-    if bin_path:
-        opts.binary_location = bin_path
-
-    # ✅ 이미지 차단(속도↑)
-    opts.add_experimental_option("prefs", {
-        "profile.managed_default_content_settings.images": 2,
-        "profile.default_content_setting_values.notifications": 2,
-    })
-
-    # ✅ Docker에 설치된 chromedriver 고정
-    # (너 Dockerfile에서 chromium-driver 설치했으니 보통 /usr/bin/chromedriver)
-    service = Service(executable_path="/usr/bin/chromedriver")
-
-    driver = webdriver.Chrome(service=service, options=opts)
-    driver.implicitly_wait(0.5)
-    return driver
+def simple_tokens(s: str) -> list[str]:
+    """
+    아주 단순 토큰화(한/영/숫자만 남기고 분리)
+    - 키워드 중복용
+    """
+    s = (s or "").lower()
+    s = re.sub(r"[^0-9a-z가-힣 ]+", " ", s)
+    parts = [p for p in s.split() if len(p) >= 2]
+    return parts
 
 
-def switch_to_cafe_main_iframe(driver) -> bool:
+# =====================
+# 목록 수집
+# =====================
+def collect_article_list(target_date: date_cls, max_pages: int = 30) -> list[dict]:
+    articles = []
+    target_str = target_date.strftime("%Y.%m.%d")
+    for page in range(1, max_pages + 1):
+        res = requests.get(BASE_URL + str(page), headers=HEADERS, timeout=20)
+        if res.status_code != 200:
+            break
+
+        soup = BeautifulSoup(res.text, "html.parser")
+        rows = soup.select("tr")
+
+        stop_flag = False
+
+        for row in rows:
+            title_tag = row.select_one("a.article")
+            date_tag = row.select_one("td.td_date")
+            author_tag = row.select_one("td.td_name")  # 작성자(목록에 보이는 경우)
+
+            if not title_tag or not date_tag:
+                continue
+
+            date_text = date_tag.get_text(strip=True)
+
+            # ✅ 날짜 필터는 "목록에서만" 적용
+            if not is_target_date(date_text, target_date):
+                # 과거 날짜의 경우, 더 아래(더 옛날)로 내려가면 중단
+                # date_text가 YYYY.MM.DD일 때만 비교
+                if re.match(r"^\d{4}\.\d{2}\.\d{2}$", date_text) and date_text < target_str:
+                    stop_flag = True
+                continue
+
+            article_url = urljoin("https://cafe.naver.com", title_tag.get("href", ""))
+            title = title_tag.get_text(strip=True)
+            author = author_tag.get_text(strip=True) if author_tag else ""
+
+            articles.append(
+                {
+                    "title": title,
+                    "title_norm": normalize_title(title),
+                    "author": author,
+                    "url": article_url,
+                    "date": date_text,
+                }
+            )
+
+        if stop_flag:
+            break
+
+        time.sleep(0.25)
+
+    return articles
+
+
+# =====================
+# 본문 수집
+# =====================
+def fetch_content(url: str) -> str:
     try:
-        driver.switch_to.default_content()
-        iframes = driver.find_elements(By.ID, "cafe_main")
-        if iframes:
-            driver.switch_to.frame("cafe_main")
-            return True
+        res = requests.get(url, headers=HEADERS, timeout=25)
+        if res.status_code != 200:
+            return ""
+        soup = BeautifulSoup(res.text, "html.parser")
+
+        iframe = soup.select_one("iframe#cafe_main")
+        if iframe and iframe.get("src"):
+            iframe_url = urljoin("https://cafe.naver.com", iframe["src"])
+            res2 = requests.get(iframe_url, headers=HEADERS, timeout=25)
+            if res2.status_code != 200:
+                return ""
+            soup = BeautifulSoup(res2.text, "html.parser")
+
+        content = soup.select_one("div.se-main-container")
+        if not content:
+            # 구형 에디터 fallback
+            content = soup.select_one("div#postViewArea") or soup.select_one("div.ContentRenderer")
+
+        if not content:
+            return ""
+
+        return content.get_text(" ", strip=True)
+
     except Exception:
-        pass
-    return False
-
-
-def wait_list_loaded(driver):
-    wait = WebDriverWait(driver, 25)
-
-    def has_links_in_current_doc(d):
-        return len(d.find_elements(By.CSS_SELECTOR, LINK_CSS)) > 0
-
-    if switch_to_cafe_main_iframe(driver):
-        try:
-            wait.until(has_links_in_current_doc)
-            return
-        except Exception:
-            pass
-
-    try:
-        driver.switch_to.default_content()
-    except Exception:
-        pass
-
-    wait.until(has_links_in_current_doc)
-
-
-def is_notice_row(row_text: str, row_el) -> bool:
-    t = clean(row_text)
-    lines = [x.strip() for x in t.split("\n") if x.strip()]
-    if any(x == "공지" for x in lines):
-        return True
-    try:
-        if row_el is not None and len(row_el.find_elements(By.XPATH, ".//*[normalize-space()='공지']")) > 0:
-            return True
-    except Exception:
-        pass
-    return False
-
-
-def pick_row_author(row_text: str, title: str) -> str:
-    t = clean(row_text)
-    lines = [x.strip() for x in t.split("\n") if x.strip()]
-    lines = [x for x in lines if x != title]
-    lines = [x for x in lines if not is_time_token(x)]
-    lines = [x for x in lines if not re.fullmatch(r"20\d{2}\.\d{2}\.\d{2}\.?", x)]
-    bad = ["조회", "좋아요", "댓글", "댓글수"]
-    lines = [x for x in lines if not any(b in x for b in bad)]
-    lines = [x for x in lines if x != "공지"]
-    for x in lines:
-        if 1 <= len(x) <= 30:
-            return x
-    return ""
-
-
-def extract_article_id_from_href(href: str) -> str:
-    m = ARTICLEID_RE.search(href or "")
-    if not m:
         return ""
-    return m.group(1) or m.group(2) or ""
 
 
-def collect_by_paging(
-    target_date: date_cls,
-    headless: bool,
-    max_pages: int,
-    stop_no_match_pages: int,
-    pause: float,
-):
-    today = kst_today()
-    is_today = (target_date == today)
-    target_dot = target_date.strftime("%Y.%m.%d")
-    target_iso = target_date.strftime("%Y-%m-%d")
-
-    driver = make_driver(headless=headless)
-    collected = {}
-    no_match_pages = 0
-
-    try:
-        for page in range(1, int(max_pages) + 1):
-            driver.get(build_page_url(page))
-
-            wait_list_loaded(driver)
-            time.sleep(pause)
-
-            rows = driver.find_elements(By.CSS_SELECTOR, "tr")
-            if len(rows) < 5:
-                rows = driver.find_elements(By.CSS_SELECTOR, "li") + rows
-
-            page_matches = 0
-
-            for row in rows:
-                try:
-                    row_text = clean(row.text)
-                    if not row_text:
-                        continue
-                    if is_notice_row(row_text, row):
-                        continue
-
-                    links = row.find_elements(By.CSS_SELECTOR, LINK_CSS)
-                    if not links:
-                        continue
-
-                    a = links[0]
-                    href = clean(a.get_attribute("href"))
-                    if not href:
-                        continue
-
-                    article_id = extract_article_id_from_href(href)
-                    if not article_id:
-                        continue
-
-                    title_raw = clean(a.text)
-                    if not title_raw:
-                        lines = [x.strip() for x in row_text.split("\n") if x.strip()]
-                        title_raw = lines[0] if lines else ""
-                    if not title_raw:
-                        continue
-
-                    hhmm = extract_time_token(row_text)
-                    dot = extract_date_token(row_text)
-
-                    if is_today:
-                        # 오늘: 시간형만 수집
-                        if not hhmm:
-                            continue
-                        date_raw = hhmm
-                    else:
-                        # 과거: 날짜형만 수집
-                        if hhmm:
-                            continue
-                        if not dot or dot != target_dot:
-                            continue
-                        date_raw = dot
-
-                    collected[href] = {
-                        "date": target_iso,
-                        "date_raw": date_raw,
-                        "author": pick_row_author(row_text, title_raw),
-                        "title": title_raw,
-                        "title_norm": normalize_title(title_raw),
-                        "link": href,
-                    }
-                    page_matches += 1
-
-                except Exception:
-                    continue
-
-            if page_matches > 0:
-                no_match_pages = 0
-            else:
-                no_match_pages += 1
-
-            if no_match_pages >= int(stop_no_match_pages):
-                break
-
-            time.sleep(pause)
-
-    finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
-
-    df = pd.DataFrame(list(collected.values()))
-    if not df.empty:
-        df = df.drop_duplicates(subset=["link"]).copy()
-        df = df.sort_values(by="date_raw", ascending=False)
-    return df.to_dict("records")
+# =====================
+# 중복 판정들
+# =====================
+def dup_by_author(df: pd.DataFrame):
+    # 같은 작성자 그룹(2개 이상)
+    groups = df[df["author"].astype(str).str.len() > 0].groupby("author").indices
+    pairs = []
+    for author, idxs in groups.items():
+        if len(idxs) >= 2:
+            idxs = list(idxs)
+            for i in range(len(idxs)):
+                for j in range(i + 1, len(idxs)):
+                    pairs.append((idxs[i], idxs[j], 1.0, f"작성자 동일: {author}"))
+    return pairs
 
 
-# =========================
-# 중복/유사
-# =========================
-def compute_author_dups(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame(columns=["date", "author", "count"])
-    a = df.groupby(["date", "author"]).size().reset_index(name="count")
-    return a[a["count"] >= 2].sort_values(by="count", ascending=False)
+def dup_by_title(df: pd.DataFrame):
+    groups = df.groupby("title_norm").indices
+    pairs = []
+    for t, idxs in groups.items():
+        if t and len(idxs) >= 2:
+            idxs = list(idxs)
+            for i in range(len(idxs)):
+                for j in range(i + 1, len(idxs)):
+                    pairs.append((idxs[i], idxs[j], 1.0, "제목 동일"))
+    return pairs
 
 
-def compute_exact_dups(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame(columns=df.columns)
-    return df[df.duplicated(subset=["date", "title_norm"], keep=False)].copy()
+def dup_by_keywords(df: pd.DataFrame, jaccard_threshold: float = 0.6):
+    """
+    제목+본문 토큰으로 Jaccard 유사도
+    """
+    token_sets = []
+    for _, r in df.iterrows():
+        tokens = simple_tokens(f"{r.get('title','')} {r.get('content','')}")
+        token_sets.append(set(tokens))
 
-
-def compute_keyword_groups(df: pd.DataFrame, min_count: int = 2):
-    if df.empty:
-        return pd.DataFrame(columns=["keyword", "count", "examples"])
-
-    tokens_list = []
-    for _, row in df.iterrows():
-        tokens_list.append(tokenize(row["title"]))
-
-    inv = {}
-    for idx, toks in enumerate(tokens_list):
-        for tok in set(toks):
-            inv.setdefault(tok, []).append(idx)
-
-    rows = []
-    for kw, idxs in inv.items():
-        if len(idxs) >= min_count:
-            ex = [df.iloc[i]["title"] for i in idxs[:3]]
-            rows.append({
-                "keyword": kw,
-                "count": len(idxs),
-                "examples": " | ".join(ex),
-            })
-
-    out = pd.DataFrame(rows)
-    if out.empty:
-        return out
-    return out.sort_values(by=["count", "keyword"], ascending=[False, True])
-
-
-def compute_ai_similar(df: pd.DataFrame, threshold: float = 0.78) -> pd.DataFrame:
-    cols = ["title_a", "title_b", "similarity", "link_a", "link_b"]
-    if df.empty or len(df) < 2:
-        return pd.DataFrame(columns=cols)
-
-    titles_raw = df["title"].fillna("").astype(str).tolist()
-    titles = df["title_norm"].fillna("").astype(str).tolist()
-    links = df["link"].fillna("").astype(str).tolist()
-
-    vec_w = TfidfVectorizer(analyzer="word", ngram_range=(1, 2), min_df=1)
-    Xw = vec_w.fit_transform(titles)
-    Mw = cosine_similarity(Xw)
-
-    vec_c = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=1)
-    Xc = vec_c.fit_transform(titles)
-    Mc = cosine_similarity(Xc)
-
-    M = 0.55 * Mw + 0.45 * Mc
-
-    rows = []
-    n = len(titles)
+    pairs = []
+    n = len(token_sets)
     for i in range(n):
         for j in range(i + 1, n):
-            s = float(M[i, j])
-            if s >= threshold:
-                rows.append({
-                    "title_a": titles_raw[i],
-                    "title_b": titles_raw[j],
-                    "similarity": round(s, 3),
-                    "link_a": links[i],
-                    "link_b": links[j],
-                })
-
-    out = pd.DataFrame(rows, columns=cols)
-    return out.sort_values(by="similarity", ascending=False) if not out.empty else out
+            a, b = token_sets[i], token_sets[j]
+            if not a or not b:
+                continue
+            inter = len(a & b)
+            union = len(a | b)
+            score = inter / union if union else 0.0
+            if score >= jaccard_threshold:
+                pairs.append((i, j, score, f"키워드 중복(Jaccard {score:.2f})"))
+    return pairs
 
 
-# =========================
-# UI
-# =========================
+def dup_by_ai(df: pd.DataFrame, threshold: float = 0.7):
+    """
+    TF-IDF cosine similarity
+    """
+    texts = df["content"].fillna("").astype(str).tolist()
+    # 너무 짧은 텍스트가 많으면 min_df=1로 완화
+    try:
+        vectorizer = TfidfVectorizer(min_df=2)
+        tfidf = vectorizer.fit_transform(texts)
+    except Exception:
+        vectorizer = TfidfVectorizer(min_df=1)
+        tfidf = vectorizer.fit_transform(texts)
+
+    sim = cosine_similarity(tfidf)
+
+    pairs = []
+    for i in range(len(sim)):
+        for j in range(i + 1, len(sim)):
+            if sim[i, j] >= threshold:
+                pairs.append((i, j, float(sim[i, j]), f"AI 유사(cos {sim[i,j]:.2f})"))
+    return pairs
+
+
+def build_pairs_table(df: pd.DataFrame, pairs: list[tuple]):
+    """
+    pairs: (i, j, score, reason)
+    """
+    rows = []
+    for i, j, score, reason in pairs:
+        rows.append(
+            {
+                "A_idx": i,
+                "A_title": df.loc[i, "title"],
+                "A_author": df.loc[i, "author"],
+                "A_url": df.loc[i, "url"],
+                "B_idx": j,
+                "B_title": df.loc[j, "title"],
+                "B_author": df.loc[j, "author"],
+                "B_url": df.loc[j, "url"],
+                "score": round(float(score), 3),
+                "reason": reason,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+# =====================
+# Streamlit UI
+# =====================
 st.set_page_config(page_title="클랜/방송/디스코드 중복검사", layout="wide")
-st.title("클랜/방송/디스코드 중복검사")
 
-with st.expander("설정", expanded=True):
-    c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 1])
-    with c1:
-        target_date = st.date_input("날짜 선택", value=kst_today())
-    with c2:
-        headless = st.checkbox("헤드리스", value=True)
-    with c3:
-        max_pages = st.number_input("최대 페이지", min_value=1, max_value=500, value=120, step=5)
-    with c4:
-        stop_no_match_pages = st.number_input("연속 0페이지면 종료", min_value=1, max_value=10, value=2, step=1)
-    with c5:
-        pause = st.number_input("페이지 대기(초)", min_value=0.05, max_value=2.00, value=0.15, step=0.05)
+# ✅ 화면 폭/높이 느낌을 맞추는 CSS (강제는 아니고 최대한 근접)
+st.markdown(
+    """
+<style>
+.block-container {max-width: 1400px;}
+</style>
+""",
+    unsafe_allow_html=True,
+)
 
-c6, c7 = st.columns([1, 1])
-with c6:
-    keyword_min_count = st.number_input("키워드 중복 최소 건수", min_value=2, max_value=20, value=2, step=1)
-with c7:
-    sim_threshold = st.slider("AI 유사도 기준", 0.50, 0.99, 0.78, 0.01)
+st.title("📌 클랜/방송/디스코드 중복검사")
+
+# --- 상단 버튼(토글) 영역 ---
+colA, colB, colC, colD, colE = st.columns([1, 1, 1, 1, 1])
+with colA:
+    opt_original = st.toggle("📌 원본", value=True)
+with colB:
+    opt_author = st.toggle("🚨 작성자 동일", value=True)
+with colC:
+    opt_title = st.toggle("🧷 제목 동일", value=True)
+with colD:
+    opt_keyword = st.toggle("🔎 키워드 중복", value=False)
+with colE:
+    opt_ai = st.toggle("🤖 AI 유사", value=True)
 
 st.divider()
 
-if st.button("수집 시작", use_container_width=True):
-    st.session_state.posts = []
-    try:
-        posts = collect_by_paging(
-            target_date=target_date,
-            headless=headless,
-            max_pages=int(max_pages),
-            stop_no_match_pages=int(stop_no_match_pages),
-            pause=float(pause),
+# --- 설정 영역 ---
+left, right = st.columns([1, 1])
+
+with left:
+    target_date = st.date_input(
+        "📅 수집 날짜 선택 (KST 기준)",
+        datetime.now(KST).date() if KST else datetime.now().date(),
+    )
+
+with right:
+    max_pages = st.number_input("📄 최대 페이지 수", min_value=1, max_value=200, value=30, step=1)
+
+# 기준별 임계치 옵션
+with st.expander("⚙️ 중복 판정 옵션", expanded=False):
+    ai_threshold = st.slider("🤖 AI 유사 임계치 (cosine)", 0.1, 0.99, 0.70, 0.01)
+    kw_threshold = st.slider("🔎 키워드 중복 임계치 (Jaccard)", 0.1, 0.99, 0.60, 0.01)
+
+st.divider()
+
+# 세션 초기화
+if "df" not in st.session_state:
+    st.session_state["df"] = None
+
+run = st.button("📥 게시글 수집 시작", type="primary")
+
+if run:
+    # 1) 목록 수집
+    with st.spinner("게시글 목록 수집 중..."):
+        articles = collect_article_list(target_date, max_pages=int(max_pages))
+
+    if not articles:
+        st.error("목록에서 해당 날짜 게시글을 찾지 못했어. (날짜/페이지 설정 확인)")
+        st.stop()
+
+    st.success(f"목록 수집 완료: {len(articles)}개")
+
+    # 2) 본문 수집
+    progress = st.progress(0.0)
+    contents = []
+    for i, art in enumerate(articles):
+        contents.append(fetch_content(art["url"]))
+        progress.progress((i + 1) / len(articles))
+        time.sleep(0.15)
+
+    df = pd.DataFrame(articles)
+    df["content"] = contents
+
+    st.session_state["df"] = df
+
+# --- 결과 표시 ---
+df = st.session_state.get("df")
+
+if df is not None:
+    st.subheader("✅ 수집 결과")
+
+    if opt_original:
+        st.dataframe(
+            df[["date", "author", "title", "url"]].copy(),
+            use_container_width=True,
+            hide_index=True,
         )
-        st.session_state.posts = posts
-        st.success(f"수집 완료: {len(posts)}개")
-    except Exception:
-        st.error("수집 오류")
-        st.code(traceback.format_exc())
 
-df = (
-    pd.DataFrame(st.session_state.posts)
-    if "posts" in st.session_state and st.session_state.posts
-    else pd.DataFrame(columns=["date", "date_raw", "author", "title", "title_norm", "link"])
-)
+    # 선택된 기준으로 중복쌍 만들기
+    all_pairs = []
+    if opt_author:
+        all_pairs += dup_by_author(df)
+    if opt_title:
+        all_pairs += dup_by_title(df)
+    if opt_keyword:
+        all_pairs += dup_by_keywords(df, jaccard_threshold=float(kw_threshold))
+    if opt_ai:
+        all_pairs += dup_by_ai(df, threshold=float(ai_threshold))
 
-author_dups = compute_author_dups(df)
-exact_dups = compute_exact_dups(df)
-keyword_groups = compute_keyword_groups(df, min_count=int(keyword_min_count))
-ai_similar = compute_ai_similar(df, threshold=float(sim_threshold))
+    # 기준이 하나도 선택 안 됐을 때
+    if not (opt_author or opt_title or opt_keyword or opt_ai):
+        st.info("중복 기준 버튼을 하나 이상 켜줘.")
+        st.stop()
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["📌 원본", "🚨 작성자 동일", "🧨 제목 동일", "🔎 키워드 중복", "🤖 AI 유사"])
+    # 결과 정리(같은 (i,j) 중복 reason 합치기)
+    if all_pairs:
+        merged = {}
+        for i, j, score, reason in all_pairs:
+            key = (min(i, j), max(i, j))
+            if key not in merged:
+                merged[key] = {"score": score, "reasons": [reason]}
+            else:
+                merged[key]["score"] = max(merged[key]["score"], score)
+                merged[key]["reasons"].append(reason)
 
-with tab1:
-    st.dataframe(df, use_container_width=True)
+        final_pairs = []
+        for (i, j), v in merged.items():
+            final_pairs.append((i, j, v["score"], " / ".join(v["reasons"])))
 
-with tab2:
-    st.dataframe(author_dups if not author_dups.empty else pd.DataFrame(), use_container_width=True)
+        result_df = build_pairs_table(df, final_pairs).sort_values(["score"], ascending=False)
 
-with tab3:
-    st.dataframe(exact_dups if not exact_dups.empty else pd.DataFrame(), use_container_width=True)
+        st.subheader("⚠️ 중복 의심 결과")
+        st.dataframe(result_df, use_container_width=True, hide_index=True)
 
-with tab4:
-    st.dataframe(keyword_groups if not keyword_groups.empty else pd.DataFrame(), use_container_width=True)
-
-with tab5:
-    st.dataframe(ai_similar if not ai_similar.empty else pd.DataFrame(), use_container_width=True)
+    else:
+        st.success("🎉 선택한 기준에서는 중복 의심이 없어!")
