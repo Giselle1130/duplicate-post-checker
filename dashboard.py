@@ -1,6 +1,6 @@
 import re
 import time
-from datetime import datetime, date as date_cls
+from datetime import datetime, date as date_cls, timedelta
 from urllib.parse import urljoin
 
 import requests
@@ -11,11 +11,25 @@ from bs4 import BeautifulSoup
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
+# ---------------------
+# KST 처리 (배포 환경 안전)
+# ---------------------
 try:
     from zoneinfo import ZoneInfo
     KST = ZoneInfo("Asia/Seoul")
 except Exception:
     KST = None
+
+
+def kst_now() -> datetime:
+    # ZoneInfo가 있으면 사용, 없으면 UTC+9로 강제
+    if KST:
+        return datetime.now(KST)
+    return datetime.utcnow() + timedelta(hours=9)
+
+
+def kst_today() -> date_cls:
+    return kst_now().date()
 
 
 # =====================
@@ -37,14 +51,16 @@ HEADERS = {
 def is_target_date(date_text: str, target_date: date_cls) -> bool:
     """
     KST 기준:
-    - 선택 날짜가 오늘이면: 'HH:MM' 형태만 수집
-    - 그 외(과거 날짜)이면: 'YYYY.MM.DD' 정확히 일치만 수집
+    - 선택 날짜가 '오늘'이면: 목록 날짜가 HH:MM 인 것만 수집
+    - 과거 날짜이면: 목록 날짜가 YYYY.MM.DD 정확히 일치만 수집
     """
-    today_kst = datetime.now(KST).date() if KST else datetime.now().date()
+    today_kst = kst_today()
 
+    # 오늘인 경우: HH:MM만 수집
     if target_date == today_kst:
         return bool(re.match(r"^\d{1,2}:\d{2}$", date_text))
 
+    # 과거 날짜: YYYY.MM.DD만 수집
     return date_text == target_date.strftime("%Y.%m.%d")
 
 
@@ -81,6 +97,7 @@ def simple_tokens(s: str) -> list[str]:
 def collect_article_list(target_date: date_cls, max_pages: int = 30) -> list[dict]:
     articles = []
     target_str = target_date.strftime("%Y.%m.%d")
+
     for page in range(1, max_pages + 1):
         res = requests.get(BASE_URL + str(page), headers=HEADERS, timeout=20)
         if res.status_code != 200:
@@ -94,7 +111,7 @@ def collect_article_list(target_date: date_cls, max_pages: int = 30) -> list[dic
         for row in rows:
             title_tag = row.select_one("a.article")
             date_tag = row.select_one("td.td_date")
-            author_tag = row.select_one("td.td_name")  # 작성자(목록에 보이는 경우)
+            author_tag = row.select_one("td.td_name")  # 목록에서 보이는 작성자 (없을 수 있음)
 
             if not title_tag or not date_tag:
                 continue
@@ -103,23 +120,27 @@ def collect_article_list(target_date: date_cls, max_pages: int = 30) -> list[dic
 
             # ✅ 날짜 필터는 "목록에서만" 적용
             if not is_target_date(date_text, target_date):
-                # 과거 날짜의 경우, 더 아래(더 옛날)로 내려가면 중단
-                # date_text가 YYYY.MM.DD일 때만 비교
+                # 과거 날짜 모드에서 더 옛날로 내려가면 중단 (YYYY.MM.DD 형태일 때만)
                 if re.match(r"^\d{4}\.\d{2}\.\d{2}$", date_text) and date_text < target_str:
                     stop_flag = True
                 continue
 
-            article_url = urljoin("https://cafe.naver.com", title_tag.get("href", ""))
+            href = title_tag.get("href", "")
+            if not href:
+                continue
+
+            article_url = urljoin("https://cafe.naver.com", href)
             title = title_tag.get_text(strip=True)
             author = author_tag.get_text(strip=True) if author_tag else ""
 
             articles.append(
                 {
+                    "date": target_date.strftime("%Y-%m-%d"),
+                    "date_raw": date_text,
+                    "author": author,
                     "title": title,
                     "title_norm": normalize_title(title),
-                    "author": author,
-                    "url": article_url,
-                    "date": date_text,
+                    "link": article_url,
                 }
             )
 
@@ -167,7 +188,6 @@ def fetch_content(url: str) -> str:
 # 중복 판정들
 # =====================
 def dup_by_author(df: pd.DataFrame):
-    # 같은 작성자 그룹(2개 이상)
     groups = df[df["author"].astype(str).str.len() > 0].groupby("author").indices
     pairs = []
     for author, idxs in groups.items():
@@ -192,9 +212,6 @@ def dup_by_title(df: pd.DataFrame):
 
 
 def dup_by_keywords(df: pd.DataFrame, jaccard_threshold: float = 0.6):
-    """
-    제목+본문 토큰으로 Jaccard 유사도
-    """
     token_sets = []
     for _, r in df.iterrows():
         tokens = simple_tokens(f"{r.get('title','')} {r.get('content','')}")
@@ -207,20 +224,14 @@ def dup_by_keywords(df: pd.DataFrame, jaccard_threshold: float = 0.6):
             a, b = token_sets[i], token_sets[j]
             if not a or not b:
                 continue
-            inter = len(a & b)
-            union = len(a | b)
-            score = inter / union if union else 0.0
+            score = len(a & b) / len(a | b) if (a | b) else 0.0
             if score >= jaccard_threshold:
                 pairs.append((i, j, score, f"키워드 중복(Jaccard {score:.2f})"))
     return pairs
 
 
 def dup_by_ai(df: pd.DataFrame, threshold: float = 0.7):
-    """
-    TF-IDF cosine similarity
-    """
     texts = df["content"].fillna("").astype(str).tolist()
-    # 너무 짧은 텍스트가 많으면 min_df=1로 완화
     try:
         vectorizer = TfidfVectorizer(min_df=2)
         tfidf = vectorizer.fit_transform(texts)
@@ -239,9 +250,6 @@ def dup_by_ai(df: pd.DataFrame, threshold: float = 0.7):
 
 
 def build_pairs_table(df: pd.DataFrame, pairs: list[tuple]):
-    """
-    pairs: (i, j, score, reason)
-    """
     rows = []
     for i, j, score, reason in pairs:
         rows.append(
@@ -249,11 +257,11 @@ def build_pairs_table(df: pd.DataFrame, pairs: list[tuple]):
                 "A_idx": i,
                 "A_title": df.loc[i, "title"],
                 "A_author": df.loc[i, "author"],
-                "A_url": df.loc[i, "url"],
+                "A_link": df.loc[i, "link"],
                 "B_idx": j,
                 "B_title": df.loc[j, "title"],
                 "B_author": df.loc[j, "author"],
-                "B_url": df.loc[j, "url"],
+                "B_link": df.loc[j, "link"],
                 "score": round(float(score), 3),
                 "reason": reason,
             }
@@ -266,7 +274,6 @@ def build_pairs_table(df: pd.DataFrame, pairs: list[tuple]):
 # =====================
 st.set_page_config(page_title="클랜/방송/디스코드 중복검사", layout="wide")
 
-# ✅ 화면 폭/높이 느낌을 맞추는 CSS (강제는 아니고 최대한 근접)
 st.markdown(
     """
 <style>
@@ -278,7 +285,7 @@ st.markdown(
 
 st.title("📌 클랜/방송/디스코드 중복검사")
 
-# --- 상단 버튼(토글) 영역 ---
+# --- 상단 토글 버튼 ---
 colA, colB, colC, colD, colE = st.columns([1, 1, 1, 1, 1])
 with colA:
     opt_original = st.toggle("📌 원본", value=True)
@@ -293,33 +300,26 @@ with colE:
 
 st.divider()
 
-# --- 설정 영역 ---
 left, right = st.columns([1, 1])
 
 with left:
-    target_date = st.date_input(
-        "📅 수집 날짜 선택 (KST 기준)",
-        datetime.now(KST).date() if KST else datetime.now().date(),
-    )
+    target_date = st.date_input("📅 수집 날짜 선택 (KST 기준)", kst_today())
 
 with right:
-    max_pages = st.number_input("📄 최대 페이지 수", min_value=1, max_value=200, value=30, step=1)
+    max_pages = st.number_input("📄 최대 페이지 수", min_value=1, max_value=200, value=10, step=1)
 
-# 기준별 임계치 옵션
 with st.expander("⚙️ 중복 판정 옵션", expanded=False):
     ai_threshold = st.slider("🤖 AI 유사 임계치 (cosine)", 0.1, 0.99, 0.70, 0.01)
     kw_threshold = st.slider("🔎 키워드 중복 임계치 (Jaccard)", 0.1, 0.99, 0.60, 0.01)
 
 st.divider()
 
-# 세션 초기화
 if "df" not in st.session_state:
     st.session_state["df"] = None
 
 run = st.button("📥 게시글 수집 시작", type="primary")
 
 if run:
-    # 1) 목록 수집
     with st.spinner("게시글 목록 수집 중..."):
         articles = collect_article_list(target_date, max_pages=int(max_pages))
 
@@ -329,11 +329,10 @@ if run:
 
     st.success(f"목록 수집 완료: {len(articles)}개")
 
-    # 2) 본문 수집
     progress = st.progress(0.0)
     contents = []
     for i, art in enumerate(articles):
-        contents.append(fetch_content(art["url"]))
+        contents.append(fetch_content(art["link"]))
         progress.progress((i + 1) / len(articles))
         time.sleep(0.15)
 
@@ -342,20 +341,14 @@ if run:
 
     st.session_state["df"] = df
 
-# --- 결과 표시 ---
 df = st.session_state.get("df")
 
 if df is not None:
     st.subheader("✅ 수집 결과")
 
     if opt_original:
-        st.dataframe(
-            df[["date", "author", "title", "url"]].copy(),
-            use_container_width=True,
-            hide_index=True,
-        )
+        st.dataframe(df[["date", "date_raw", "author", "title", "title_norm", "link"]], use_container_width=True)
 
-    # 선택된 기준으로 중복쌍 만들기
     all_pairs = []
     if opt_author:
         all_pairs += dup_by_author(df)
@@ -366,12 +359,10 @@ if df is not None:
     if opt_ai:
         all_pairs += dup_by_ai(df, threshold=float(ai_threshold))
 
-    # 기준이 하나도 선택 안 됐을 때
     if not (opt_author or opt_title or opt_keyword or opt_ai):
         st.info("중복 기준 버튼을 하나 이상 켜줘.")
         st.stop()
 
-    # 결과 정리(같은 (i,j) 중복 reason 합치기)
     if all_pairs:
         merged = {}
         for i, j, score, reason in all_pairs:
@@ -389,7 +380,6 @@ if df is not None:
         result_df = build_pairs_table(df, final_pairs).sort_values(["score"], ascending=False)
 
         st.subheader("⚠️ 중복 의심 결과")
-        st.dataframe(result_df, use_container_width=True, hide_index=True)
-
+        st.dataframe(result_df, use_container_width=True)
     else:
         st.success("🎉 선택한 기준에서는 중복 의심이 없어!")
