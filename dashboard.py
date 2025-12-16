@@ -1,3 +1,4 @@
+import os
 import re
 import time
 from datetime import datetime, date as date_cls, timedelta
@@ -52,27 +53,49 @@ BASE_HEADERS = {
 
 
 # =====================
+# ✅ secrets/env/UI 안전 조회
+# =====================
+def safe_get_secrets(key: str) -> str:
+    """
+    st.secrets가 없거나(secrets.toml 없음) 파싱 실패해도 절대 터지지 않게.
+    """
+    try:
+        # st.secrets는 접근 시점에 파일 없으면 예외를 낼 수 있음
+        return str(st.secrets.get(key, "")).strip()
+    except Exception:
+        return ""
+
+
+def get_env(key: str) -> str:
+    return (os.environ.get(key) or "").strip()
+
+
+# =====================
 # ✅ 네이버 로그인(쿠키) 적용 헤더
 # =====================
 def get_headers() -> dict:
     headers = BASE_HEADERS.copy()
 
-    # 1) secrets 우선 (Render 환경변수/Streamlit secrets로 넣을 수 있음)
-    nid_aut = st.secrets.get("NID_AUT", "") if hasattr(st, "secrets") else ""
-    nid_ses = st.secrets.get("NID_SES", "") if hasattr(st, "secrets") else ""
-
-    # 2) UI 입력값(세션) 있으면 덮어쓰기
-    cookie = st.session_state.get("naver_cookie", "")
+    # 1) UI 입력(세션)이 최우선
+    cookie = (st.session_state.get("naver_cookie") or "").strip()
     if cookie:
         headers["Cookie"] = cookie
         return headers
 
-    # 3) secrets가 있으면 cookie 구성
+    # 2) Render 환경변수 (추천)
+    nid_aut = get_env("NID_AUT")
+    nid_ses = get_env("NID_SES")
     if nid_aut and nid_ses:
         headers["Cookie"] = f"NID_AUT={nid_aut}; NID_SES={nid_ses}"
         return headers
 
-    # 4) 쿠키 없으면 그냥 반환 (배포에서는 막힐 수 있음)
+    # 3) Streamlit secrets (있으면 사용, 없으면 무시)
+    nid_aut = safe_get_secrets("NID_AUT")
+    nid_ses = safe_get_secrets("NID_SES")
+    if nid_aut and nid_ses:
+        headers["Cookie"] = f"NID_AUT={nid_aut}; NID_SES={nid_ses}"
+        return headers
+
     return headers
 
 
@@ -81,12 +104,8 @@ def get_headers() -> dict:
 # =====================
 def infer_date_from_list_text(date_text: str) -> date_cls | None:
     s = (date_text or "").strip()
-
-    # HH:MM => 오늘(KST)
     if re.match(r"^\d{1,2}:\d{2}$", s):
         return kst_today()
-
-    # YYYY.MM.DD => 해당 날짜
     m = re.match(r"^(\d{4})\.(\d{2})\.(\d{2})$", s)
     if m:
         y, mo, d = map(int, m.groups())
@@ -94,13 +113,11 @@ def infer_date_from_list_text(date_text: str) -> date_cls | None:
             return date_cls(y, mo, d)
         except Exception:
             return None
-
     return None
 
 
 def is_target_date(date_text: str, target_date: date_cls) -> bool:
-    inferred = infer_date_from_list_text(date_text)
-    return inferred == target_date
+    return infer_date_from_list_text(date_text) == target_date
 
 
 # =====================
@@ -143,10 +160,7 @@ def collect_article_list(target_date: date_cls, max_pages: int, debug: bool = Fa
         html = res.text or ""
         soup = BeautifulSoup(html, "html.parser")
 
-        # 1) 우선 a.article
         links = soup.select("a.article")
-
-        # 2) 없으면 /articles/ 포함 링크로 fallback
         if not links:
             links = [a for a in soup.select("a[href]") if "/articles/" in (a.get("href") or "")]
 
@@ -163,7 +177,6 @@ def collect_article_list(target_date: date_cls, max_pages: int, debug: bool = Fa
                 }
             )
 
-        # ✅ 1페이지부터 링크가 0개면: 차단/빈 HTML 가능성이 매우 큼 → 더 돌려도 소용 없음
         if page == 1 and len(links) == 0:
             break
 
@@ -174,7 +187,6 @@ def collect_article_list(target_date: date_cls, max_pages: int, debug: bool = Fa
 
             title = a.get_text(strip=True) or a.get("title", "") or ""
 
-            # date/author는 보통 같은 tr 안에 있음
             date_text = ""
             author = ""
 
@@ -187,7 +199,6 @@ def collect_article_list(target_date: date_cls, max_pages: int, debug: bool = Fa
                 if au:
                     author = au.get_text(strip=True)
 
-            # 날짜 못 잡았으면 주변에서 한번 더
             if not date_text:
                 near = a.find_parent()
                 if hasattr(near, "select_one"):
@@ -195,7 +206,6 @@ def collect_article_list(target_date: date_cls, max_pages: int, debug: bool = Fa
                     if dt2:
                         date_text = dt2.get_text(strip=True)
 
-            # ✅ 날짜 필터
             if not is_target_date(date_text, target_date):
                 continue
 
@@ -240,7 +250,6 @@ def fetch_content(url: str) -> str:
             return ""
 
         return content.get_text(" ", strip=True)
-
     except Exception:
         return ""
 
@@ -336,49 +345,36 @@ st.markdown("<style>.block-container{max-width:1400px;}</style>", unsafe_allow_h
 
 st.title("📌 클랜/방송/디스코드 중복검사")
 
-# ✅ 로그인(쿠키) 입력 영역
+# 쿠키 입력 (UI 방식)
 st.subheader("🔐 네이버 로그인 (쿠키 입력)")
-with st.expander("쿠키 입력 방법 / 입력칸 열기", expanded=True):
+with st.expander("쿠키 입력칸 열기", expanded=True):
     st.markdown(
         """
-**중요:** ID/비밀번호 입력이 아니라, **로그인된 쿠키 값만 붙여넣는 방식**이야.
+**ID/비밀번호 입력이 아니야.** 네이버 로그인 후 **쿠키 값(Value)** 만 복사해서 붙여넣는 방식!
 
-### 쿠키 복사하는 방법 (PC 크롬 기준)
-1) 네이버 카페에 접속해서 **로그인**
-2) 키보드 `F12` (개발자도구) 열기
-3) 위 탭에서 **Application(애플리케이션)** 선택  
-   - 안 보이면 `>>` 누르고 찾기
-4) 왼쪽 메뉴에서 **Cookies → https://cafe.naver.com**
-5) 오른쪽 표에서 아래 2개를 찾아서 **Value를 복사**
-   - `NID_AUT`
-   - `NID_SES`
-
-복사한 값은 아래 칸에 붙여넣기만 하면 돼.
+- 필요한 값: `NID_AUT`, `NID_SES`
+- 크롬: `F12` → `Application` → `Cookies` → `https://cafe.naver.com` → Value 복사
         """
     )
-
     nid_aut_in = st.text_input("NID_AUT 값", type="password")
     nid_ses_in = st.text_input("NID_SES 값", type="password")
 
-    col1, col2 = st.columns([1, 1])
-    with col1:
+    c1, c2 = st.columns([1, 1])
+    with c1:
         if st.button("✅ 쿠키 저장"):
             if not nid_aut_in or not nid_ses_in:
                 st.error("NID_AUT, NID_SES 둘 다 입력해야 해.")
             else:
                 st.session_state["naver_cookie"] = f"NID_AUT={nid_aut_in}; NID_SES={nid_ses_in}"
-                st.success("저장 완료! 이제 수집이 가능해.")
-    with col2:
+                st.success("저장 완료! 이제 수집 시작을 누르면 돼.")
+    with c2:
         if st.button("🧹 쿠키 삭제"):
             st.session_state.pop("naver_cookie", None)
-            st.success("쿠키 삭제 완료.")
+            st.success("삭제 완료.")
 
-cookie_ready = bool(st.session_state.get("naver_cookie")) or (
-    hasattr(st, "secrets") and st.secrets.get("NID_AUT", "") and st.secrets.get("NID_SES", "")
-)
-
+cookie_ready = bool((st.session_state.get("naver_cookie") or "").strip()) or (get_env("NID_AUT") and get_env("NID_SES")) or (safe_get_secrets("NID_AUT") and safe_get_secrets("NID_SES"))
 if not cookie_ready:
-    st.warning("⚠️ Render 배포에서는 쿠키가 없으면 목록이 0개로 나올 수 있어. (네이버가 서버 IP를 막는 경우)")
+    st.warning("⚠️ Render 배포에서는 쿠키가 없으면 네이버가 목록을 막아서 0개가 나올 수 있어.")
 st.divider()
 
 # 상단 토글
@@ -418,7 +414,7 @@ run = st.button("📥 게시글 수집 시작", type="primary")
 
 if run:
     if not cookie_ready:
-        st.error("Render 배포에서는 쿠키 없이 수집이 막힐 가능성이 매우 높아. 위에서 쿠키를 저장하고 다시 눌러줘.")
+        st.error("쿠키가 없으면 Render 배포에서 수집이 막힐 가능성이 높아. 위에서 쿠키 저장 후 다시 눌러줘.")
         st.stop()
 
     with st.spinner("게시글 목록 수집 중..."):
@@ -429,7 +425,7 @@ if run:
         st.dataframe(pd.DataFrame(debug_log), use_container_width=True)
 
     if not articles:
-        st.error("목록에서 해당 날짜 게시글을 찾지 못했어. (쿠키가 만료됐거나, 네이버가 차단/HTML 변경 가능)")
+        st.error("목록에서 해당 날짜 게시글을 찾지 못했어. (쿠키 만료/차단/HTML 변경 가능)")
         st.stop()
 
     st.success(f"목록 수집 완료: {len(articles)}개")
