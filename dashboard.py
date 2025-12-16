@@ -14,12 +14,26 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+try:
+    from webdriver_manager.chrome import ChromeDriverManager
+    USE_WDM = True
+except Exception:
+    USE_WDM = False
 
 try:
     from zoneinfo import ZoneInfo
     KST = ZoneInfo("Asia/Seoul")
 except Exception:
     KST = None
+
+
+# =========================
+# Streamlit 기본 설정 (✅ 1번만!)
+# =========================
+st.set_page_config(page_title="🏰 클랜/방송/디스코드 중복 게시글 체크", layout="wide")
+st.title("🏰 클랜/방송/디스코드 중복 게시글 체크")
 
 
 # =========================
@@ -36,11 +50,18 @@ BASE_LIST_URL = (
     "&search.boardtype=L"
 )
 
-# 링크는 케이스가 섞여서 둘 다 지원:
 ARTICLEID_RE = re.compile(r"(?:[?&]articleid=(\d+))|(?:/articles/(\d+))")
-
-# 목록에서 글 링크를 찾는 CSS
 LINK_CSS = "a[href*='articleid='], a[href*='/articles/']"
+
+# 상세에서 작성일 후보 셀렉터들 (UI가 바뀌어도 버티게 여러 개)
+DETAIL_DATE_SELECTORS = [
+    "span.date",                 # 구형
+    ".article_info .date",
+    ".ArticleTopInfo__date",     # 신형
+    ".ArticleTopInfo .date",
+    "p.date",
+    "span._articleTime",
+]
 
 
 # =========================
@@ -65,35 +86,14 @@ def extract_time_token(text: str) -> str:
     return m.group(1) if m else ""
 
 
-def extract_date_token_any(text: str):
-    """
-    목록 날짜 표기가 3종류로 나올 수 있어서 모두 대응:
-      - 2025.12.16
-      - 12.16
-      - 2025.12.16. (끝 점)
-    return: ("YMD", "2025.12.16") or ("MD", "12.16") or ("", "")
-    """
-    t = clean(text)
-    m1 = re.search(r"\b(20\d{2}\.\d{2}\.\d{2})\.?\b", t)
-    if m1:
-        return ("YMD", m1.group(1))
-    m2 = re.search(r"\b(\d{2}\.\d{2})\b", t)
-    if m2:
-        return ("MD", m2.group(1))
-    return ("", "")
+def extract_date_token(text: str) -> str:
+    m = re.search(r"\b(20\d{2}\.\d{2}\.\d{2})\.?\b", clean(text))
+    return m.group(1) if m else ""
 
 
-def parse_dot_ymd(s: str):
+def parse_dot_date(s: str):
     try:
         return datetime.strptime(s, "%Y.%m.%d").date()
-    except Exception:
-        return None
-
-
-def parse_dot_md(s: str, year: int):
-    try:
-        mm, dd = s.split(".")
-        return date_cls(year, int(mm), int(dd))
     except Exception:
         return None
 
@@ -117,29 +117,15 @@ STOPWORDS = {
 
 def normalize_title(raw: str) -> str:
     t = clean(raw)
-
-    # 끝 댓글수 제거
     t = re.sub(r"\s*\[\s*\d+\s*\]\s*$", "", t)
     t = re.sub(r"\s*\(\s*\d+\s*\)\s*$", "", t)
-
-    # [Steam] 같은 태그 제거
     t = re.sub(r"\[[^\]]{1,30}\]", " ", t)
-
-    # LV / 나이/범위 패턴 제거
     t = re.sub(r"\bLv\.?\s*\d+\b", " ", t, flags=re.IGNORECASE)
     t = re.sub(r"\b\d{1,2}\s*~\s*\d{1,2}\b", " ", t)
     t = re.sub(r"\b\d{1,2}\s*세\b", " ", t)
-
-    # url 제거
     t = re.sub(r"https?://\S+", " ", t)
-
-    # 이모지/기호 제거 (한/영/숫자/공백만 유지)
     t = re.sub(r"[^0-9A-Za-z가-힣\s]", " ", t)
-
-    # 숫자 단독 제거
     t = re.sub(r"\b\d+\b", " ", t)
-
-    # 공백 정리
     t = re.sub(r"\s+", " ", t).strip().lower()
     return t
 
@@ -155,68 +141,35 @@ def tokenize(text: str):
 # =========================
 # Selenium
 # =========================
-def guess_chrome_binary():
-    # Render/Ubuntu에서 흔한 경로들
-    candidates = [
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-        "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
-    ]
-    return candidates
-
-
 def make_driver(headless: bool = True) -> webdriver.Chrome:
     opts = Options()
-
-    # ✅ 안정 옵션
+    opts.add_argument("--disable-gpu")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1400,900")
-    opts.add_argument("--lang=ko-KR")
-
-    # ✅ 더 안정적으로 (Render에서 유용)
-    opts.add_argument("--disable-background-networking")
-    opts.add_argument("--disable-background-timer-throttling")
-    opts.add_argument("--disable-renderer-backgrounding")
-    opts.add_argument("--disable-features=Translate,BackForwardCache,AcceptCHFrame")
-    opts.add_argument("--disable-extensions")
-    opts.add_argument("--disable-notifications")
-
-    # ✅ 속도/안정
     opts.page_load_strategy = "eager"
 
     if headless:
         opts.add_argument("--headless=new")
 
-    # ✅ 이미지 차단(속도↑)
+    # 이미지 차단
     opts.add_experimental_option("prefs", {
         "profile.managed_default_content_settings.images": 2,
         "profile.default_content_setting_values.notifications": 2,
     })
 
-    # ✅ 자동화 탐지 완화(가능한 범위)
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
 
-    # ✅ 크롬 바이너리 경로 지정(있으면)
-    for p in guess_chrome_binary():
-        try:
-            import os
-            if os.path.exists(p):
-                opts.binary_location = p
-                break
-        except Exception:
-            pass
+    if USE_WDM:
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=opts)
+    else:
+        driver = webdriver.Chrome(options=opts)
 
-    # Selenium Manager가 드라이버를 알아서 맞춰줌(온라인 환경에서 안정)
-    service = Service()
-    driver = webdriver.Chrome(service=service, options=opts)
-    driver.implicitly_wait(0.5)
+    driver.implicitly_wait(0.3)
 
-    # navigator.webdriver 숨김(가능한 범위)
     try:
         driver.execute_cdp_cmd(
             "Page.addScriptToEvaluateOnNewDocument",
@@ -246,7 +199,6 @@ def wait_list_loaded(driver):
     def has_links_in_current_doc(d):
         return len(d.find_elements(By.CSS_SELECTOR, LINK_CSS)) > 0
 
-    # 1) iframe 먼저
     if switch_to_cafe_main_iframe(driver):
         try:
             wait.until(has_links_in_current_doc)
@@ -254,7 +206,6 @@ def wait_list_loaded(driver):
         except Exception:
             pass
 
-    # 2) default content에서 다시 체크
     try:
         driver.switch_to.default_content()
     except Exception:
@@ -281,9 +232,7 @@ def pick_row_author(row_text: str, title: str) -> str:
     lines = [x.strip() for x in t.split("\n") if x.strip()]
     lines = [x for x in lines if x != title]
     lines = [x for x in lines if not is_time_token(x)]
-    # 날짜형 제거(둘 다)
     lines = [x for x in lines if not re.fullmatch(r"20\d{2}\.\d{2}\.\d{2}\.?", x)]
-    lines = [x for x in lines if not re.fullmatch(r"\d{2}\.\d{2}", x)]
     bad = ["조회", "좋아요", "댓글", "댓글수"]
     lines = [x for x in lines if not any(b in x for b in bad)]
     lines = [x for x in lines if x != "공지"]
@@ -300,97 +249,218 @@ def extract_article_id_from_href(href: str) -> str:
     return m.group(1) or m.group(2) or ""
 
 
-# =========================
-# "한 페이지"만 수집 (중요: 긴 작업을 끊어서 실행)
-# =========================
-def collect_one_page(driver, target_date: date_cls, page: int, pause: float):
+def parse_detail_datetime_text(raw: str):
     """
-    return:
-      collected_dict (href -> row dict),
-      page_matches (int),
-      saw_any_row (bool)
+    상세의 작성일 텍스트를 최대한 안전하게 파싱
+    예)
+    - 2025.12.16. 23:58
+    - 2025.12.16. 오후 11:58
+    """
+    s = clean(raw)
+
+    m = re.search(r"(\d{4})\.(\d{1,2})\.(\d{1,2})\.\s*(\d{1,2}):(\d{2})", s)
+    if m:
+        y, mo, d, hh, mm = map(int, m.groups())
+        return datetime(y, mo, d, hh, mm)
+
+    m = re.search(r"(\d{4})\.(\d{1,2})\.(\d{1,2})\.\s*(오전|오후)\s*(\d{1,2}):(\d{2})", s)
+    if m:
+        y, mo, d = map(int, m.group(1, 2, 3))
+        ampm = m.group(4)
+        hh = int(m.group(5))
+        mm = int(m.group(6))
+        if ampm == "오후" and hh != 12:
+            hh += 12
+        if ampm == "오전" and hh == 12:
+            hh = 0
+        return datetime(y, mo, d, hh, mm)
+
+    return None
+
+
+def get_article_datetime_strict(driver, href: str, pause: float = 0.05):
+    """
+    ✅ 핵심: 글 상세 들어가서 '진짜 작성일' 얻기
+    - iframe 전환 포함
+    - 여러 셀렉터 시도 + 소스 정규식 백업
+    """
+    try:
+        driver.get(href)
+        time.sleep(pause)
+
+        # 상세도 cafe_main iframe인 경우가 많음
+        switch_to_cafe_main_iframe(driver)
+        wait = WebDriverWait(driver, 15)
+
+        # 1) 셀렉터로 찾기
+        for css in DETAIL_DATE_SELECTORS:
+            try:
+                el = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, css)))
+                dt = parse_detail_datetime_text(el.text)
+                if dt:
+                    return dt
+            except Exception:
+                continue
+
+        # 2) 백업: page_source에서 날짜 패턴 찾기
+        src = driver.page_source
+        m = re.search(r"(\d{4}\.\d{1,2}\.\d{1,2}\.\s*(?:오전|오후)\s*\d{1,2}:\d{2})", src)
+        if m:
+            dt = parse_detail_datetime_text(m.group(1))
+            if dt:
+                return dt
+        m = re.search(r"(\d{4}\.\d{1,2}\.\d{1,2}\.\s*\d{1,2}:\d{2})", src)
+        if m:
+            dt = parse_detail_datetime_text(m.group(1))
+            if dt:
+                return dt
+
+    except Exception:
+        return None
+
+    return None
+
+
+def collect_by_paging(
+    target_date: date_cls,
+    headless: bool,
+    max_pages: int,
+    stop_no_match_pages: int,
+    pause: float,
+):
+    """
+    ✅ '선택한 날짜만' 100% 보장 버전
+    1) 목록에서 후보 글 링크를 모음(속도 위해 최소 조건 적용)
+    2) 각 글 상세에 들어가서 실제 작성일을 읽음
+    3) target_date와 정확히 같은 글만 최종 수집
     """
     today = kst_today()
     is_today = (target_date == today)
+    target_dot = target_date.strftime("%Y.%m.%d")
     target_iso = target_date.strftime("%Y-%m-%d")
 
-    driver.get(build_page_url(page))
-    wait_list_loaded(driver)
-    time.sleep(pause)
+    driver = make_driver(headless=headless)
 
-    rows = driver.find_elements(By.CSS_SELECTOR, "tr")
-    if len(rows) < 5:
-        rows = driver.find_elements(By.CSS_SELECTOR, "li") + rows
+    # 후보 / 최종
+    candidates = {}  # link -> base info(제목/작성자/목록표시)
+    collected = {}   # link -> final info
 
-    collected = {}
-    page_matches = 0
-    saw_any = False
+    no_match_pages = 0
 
-    for row in rows:
-        try:
-            row_text = clean(row.text)
-            if not row_text:
-                continue
-            saw_any = True
-            if is_notice_row(row_text, row):
-                continue
+    try:
+        # -------------------------
+        # 1) 목록에서 후보 수집
+        # -------------------------
+        for page in range(1, int(max_pages) + 1):
+            driver.get(build_page_url(page))
+            wait_list_loaded(driver)
+            time.sleep(pause)
 
-            links = row.find_elements(By.CSS_SELECTOR, LINK_CSS)
-            if not links:
-                continue
+            rows = driver.find_elements(By.CSS_SELECTOR, "tr")
+            if len(rows) < 5:
+                rows = driver.find_elements(By.CSS_SELECTOR, "li") + rows
 
-            a = links[0]
-            href = clean(a.get_attribute("href"))
-            if not href:
-                continue
+            page_candidate = 0
 
-            article_id = extract_article_id_from_href(href)
-            if not article_id:
-                continue
+            for row in rows:
+                try:
+                    row_text = clean(row.text)
+                    if not row_text:
+                        continue
+                    if is_notice_row(row_text, row):
+                        continue
 
-            # 제목
-            title_raw = clean(a.text)
-            if not title_raw:
-                lines = [x.strip() for x in row_text.split("\n") if x.strip()]
-                title_raw = lines[0] if lines else ""
-            if not title_raw:
-                continue
+                    links = row.find_elements(By.CSS_SELECTOR, LINK_CSS)
+                    if not links:
+                        continue
+                    a = links[0]
+                    href = clean(a.get_attribute("href"))
+                    if not href:
+                        continue
 
-            hhmm = extract_time_token(row_text)
-            dtype, dtoken = extract_date_token_any(row_text)
+                    article_id = extract_article_id_from_href(href)
+                    if not article_id:
+                        continue
 
-            # ✅ 날짜 매칭 로직 (오늘=시간, 과거=날짜(YYYY.MM.DD 또는 MM.DD))
-            if is_today:
-                if not hhmm:
+                    title_raw = clean(a.text)
+                    if not title_raw:
+                        lines = [x.strip() for x in row_text.split("\n") if x.strip()]
+                        title_raw = lines[0] if lines else ""
+                    if not title_raw:
+                        continue
+
+                    hhmm = extract_time_token(row_text)
+                    dot = extract_date_token(row_text)
+
+                    # ✅ 후보 최소조건 (속도용)
+                    # - 오늘이면 "시간표시"가 있는 것만 후보
+                    # - 과거면 "YYYY.MM.DD"가 target과 같은 것만 후보
+                    if is_today:
+                        if not hhmm:
+                            continue
+                        date_raw = hhmm
+                    else:
+                        if hhmm:
+                            continue
+                        if not dot or dot != target_dot:
+                            continue
+                        date_raw = dot
+
+                    if href not in candidates:
+                        candidates[href] = {
+                            "date": target_iso,           # 최종은 target_iso로 통일
+                            "date_raw": date_raw,         # 목록표시(참고용)
+                            "author": pick_row_author(row_text, title_raw),
+                            "title": title_raw,
+                            "title_norm": normalize_title(title_raw),
+                            "link": href,
+                        }
+                        page_candidate += 1
+
+                except Exception:
                     continue
-                date_raw = hhmm
+
+            if page_candidate == 0:
+                no_match_pages += 1
             else:
-                # 과거인데 시간만 있는 경우도 가끔 있음(최근글)
-                # → MM.DD 표기까지 받아서 target_date와 매칭되면 통과
-                d_obj = None
-                if dtype == "YMD":
-                    d_obj = parse_dot_ymd(dtoken)
-                elif dtype == "MD":
-                    d_obj = parse_dot_md(dtoken, target_date.year)
+                no_match_pages = 0
 
-                if d_obj != target_date:
-                    continue
+            if no_match_pages >= int(stop_no_match_pages):
+                break
 
-                date_raw = dtoken
+            time.sleep(pause)
 
-            collected[href] = {
-                "date": target_iso,
-                "date_raw": date_raw,
-                "author": pick_row_author(row_text, title_raw),
-                "title": title_raw,
-                "title_norm": normalize_title(title_raw),
-                "link": href,
-            }
-            page_matches += 1
+        # -------------------------
+        # 2) 상세 들어가서 "진짜 작성일"로 최종 필터
+        # -------------------------
+        # (여기서부터는 다른 날짜 0개도 섞이면 안되니까 무조건 확인)
+        for idx, (href, base) in enumerate(candidates.items(), start=1):
+            dt = get_article_datetime_strict(driver, href, pause=pause)
+
+            # 작성일을 못 읽으면 안전하게 버림 (섞이는 것 방지)
+            if not dt:
+                continue
+
+            if dt.date() != target_date:
+                continue
+
+            out = dict(base)
+            out["date_detail"] = dt.strftime("%Y-%m-%d %H:%M")
+            collected[href] = out
+
+    finally:
+        try:
+            driver.quit()
         except Exception:
-            continue
+            pass
 
-    return collected, page_matches, saw_any
+    df = pd.DataFrame(list(collected.values()))
+    if not df.empty:
+        df = df.drop_duplicates(subset=["link"]).copy()
+        # detail 시간 기준 정렬
+        if "date_detail" in df.columns:
+            df = df.sort_values(by="date_detail", ascending=False)
+    return df.to_dict("records")
 
 
 # =========================
@@ -413,7 +483,9 @@ def compute_keyword_groups(df: pd.DataFrame, min_count: int = 2):
     if df.empty:
         return pd.DataFrame(columns=["keyword", "count", "examples"])
 
-    tokens_list = [tokenize(t) for t in df["title"].fillna("").astype(str).tolist()]
+    tokens_list = []
+    for _, row in df.iterrows():
+        tokens_list.append(tokenize(row["title"]))
 
     inv = {}
     for idx, toks in enumerate(tokens_list):
@@ -424,10 +496,16 @@ def compute_keyword_groups(df: pd.DataFrame, min_count: int = 2):
     for kw, idxs in inv.items():
         if len(idxs) >= min_count:
             ex = [df.iloc[i]["title"] for i in idxs[:3]]
-            rows.append({"keyword": kw, "count": len(idxs), "examples": " | ".join(ex)})
+            rows.append({
+                "keyword": kw,
+                "count": len(idxs),
+                "examples": " | ".join(ex),
+            })
 
     out = pd.DataFrame(rows)
-    return out.sort_values(by=["count", "keyword"], ascending=[False, True]) if not out.empty else out
+    if out.empty:
+        return out
+    return out.sort_values(by=["count", "keyword"], ascending=[False, True])
 
 
 def compute_ai_similar(df: pd.DataFrame, threshold: float = 0.78) -> pd.DataFrame:
@@ -441,12 +519,12 @@ def compute_ai_similar(df: pd.DataFrame, threshold: float = 0.78) -> pd.DataFram
 
     vec_w = TfidfVectorizer(analyzer="word", ngram_range=(1, 2), min_df=1)
     Xw = vec_w.fit_transform(titles)
+    Mw = cosine_similarity(Xw)
 
     vec_c = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=1)
     Xc = vec_c.fit_transform(titles)
-
-    Mw = cosine_similarity(Xw)
     Mc = cosine_similarity(Xc)
+
     M = 0.55 * Mw + 0.45 * Mc
 
     rows = []
@@ -468,48 +546,10 @@ def compute_ai_similar(df: pd.DataFrame, threshold: float = 0.78) -> pd.DataFram
 
 
 # =========================
-# Streamlit (안 튕기게 구조)
+# UI
 # =========================
-st.set_page_config(page_title="menu=178 수집/중복", layout="wide")
-st.title("🏰 클랜/방송/디스코드 중복 게시글 체크 (menu=178)")
-
-# ---- session init
-if "running" not in st.session_state:
-    st.session_state.running = False
-if "driver" not in st.session_state:
-    st.session_state.driver = None
-if "collected" not in st.session_state:
-    st.session_state.collected = {}   # href -> row dict
-if "page" not in st.session_state:
-    st.session_state.page = 1
-if "no_match_pages" not in st.session_state:
-    st.session_state.no_match_pages = 0
-if "last_error" not in st.session_state:
-    st.session_state.last_error = ""
-if "debug_events" not in st.session_state:
-    st.session_state.debug_events = []
-
-
-def debug_log(msg: str):
-    st.session_state.debug_events.append(f"{datetime.now().strftime('%H:%M:%S')}  {msg}")
-    st.session_state.debug_events = st.session_state.debug_events[-300:]
-
-
-def stop_and_cleanup():
-    st.session_state.running = False
-    st.session_state.no_match_pages = 0
-    st.session_state.page = 1
-    # driver는 원하면 유지 가능하지만, 안정적으로는 닫는 편이 좋음
-    try:
-        if st.session_state.driver is not None:
-            st.session_state.driver.quit()
-    except Exception:
-        pass
-    st.session_state.driver = None
-
-
 with st.expander("설정", expanded=True):
-    c1, c2, c3, c4, c5 = st.columns([1.2, 1.0, 1.2, 1.2, 1.2])
+    c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 1])
     with c1:
         target_date = st.date_input("날짜 선택", value=kst_today())
     with c2:
@@ -517,168 +557,70 @@ with st.expander("설정", expanded=True):
     with c3:
         max_pages = st.number_input("최대 페이지", min_value=1, max_value=500, value=120, step=5)
     with c4:
-        stop_no_match_pages = st.number_input("연속 0페이지면 종료", min_value=1, max_value=10, value=3, step=1)
+        stop_no_match_pages = st.number_input("연속 0페이지면 종료", min_value=1, max_value=10, value=2, step=1)
     with c5:
-        pause = st.number_input("페이지 대기(초)", min_value=0.05, max_value=2.00, value=0.25, step=0.05)
+        pause = st.number_input("페이지 대기(초)", min_value=0.05, max_value=2.00, value=0.12, step=0.01)
 
-    c6, c7, c8 = st.columns([1.2, 1.2, 1.2])
-    with c6:
-        pages_per_tick = st.number_input("한 번에 처리할 페이지(권장 1~3)", min_value=1, max_value=10, value=2, step=1)
-    with c7:
-        keyword_min_count = st.number_input("키워드 중복 최소 건수", min_value=2, max_value=20, value=2, step=1)
-    with c8:
-        sim_threshold = st.slider("AI 유사도 기준", 0.50, 0.99, 0.78, 0.01)
+c6, c7 = st.columns([1, 1])
+with c6:
+    keyword_min_count = st.number_input("키워드 중복 최소 건수", min_value=2, max_value=20, value=2, step=1)
+with c7:
+    sim_threshold = st.slider("AI 유사도 기준", 0.50, 0.99, 0.78, 0.01)
 
 st.divider()
 
-btn1, btn2, btn3 = st.columns([1, 1, 1])
-with btn1:
-    start = st.button("수집 시작", use_container_width=True, disabled=st.session_state.running)
-with btn2:
-    stop = st.button("중지", use_container_width=True, disabled=not st.session_state.running)
-with btn3:
-    reset = st.button("초기화(데이터 삭제)", use_container_width=True)
-
-if reset:
-    stop_and_cleanup()
-    st.session_state.collected = {}
-    st.session_state.last_error = ""
-    st.session_state.debug_events = []
-    st.success("초기화 완료")
-
-if stop:
-    stop_and_cleanup()
-    st.warning("중지됨")
-
-if start:
-    # 새 실행
-    stop_and_cleanup()
-    st.session_state.collected = {}
-    st.session_state.last_error = ""
-    st.session_state.running = True
-    debug_log("START pressed")
-
-
-# ---- Running loop (짧게 끊어서 실행)
-progress_box = st.empty()
-status_box = st.empty()
-
-if st.session_state.running:
+if st.button("수집 시작", use_container_width=True):
+    st.session_state.posts = []
     try:
-        if st.session_state.driver is None:
-            debug_log("Creating driver...")
-            st.session_state.driver = make_driver(headless=headless)
-            debug_log("Driver created.")
-
-        # 이번 tick에 몇 페이지 처리
-        pages_done = 0
-        tick_start = time.time()
-
-        while pages_done < int(pages_per_tick) and st.session_state.page <= int(max_pages):
-            p = st.session_state.page
-            progress_box.info(f"수집 중... page={p} / max={int(max_pages)}  (현재 수집 {len(st.session_state.collected)}개)")
-            debug_log(f"Collecting page {p}")
-
-            collected, page_matches, saw_any = collect_one_page(
-                st.session_state.driver, target_date=target_date, page=p, pause=float(pause)
-            )
-
-            # 병합
-            for k, v in collected.items():
-                st.session_state.collected[k] = v
-
-            if page_matches > 0:
-                st.session_state.no_match_pages = 0
-            else:
-                st.session_state.no_match_pages += 1
-
-            # 조기 종료 조건
-            if st.session_state.no_match_pages >= int(stop_no_match_pages):
-                debug_log("Stop condition met: consecutive no-match pages")
-                st.session_state.running = False
-                break
-
-            st.session_state.page += 1
-            pages_done += 1
-
-            # 너무 오래 붙잡지 않기(세션 리셋 방지)
-            if time.time() - tick_start > 12:
-                debug_log("Tick time budget reached, yielding to Streamlit rerun")
-                break
-
-        # 종료 조건: 최대 페이지 도달
-        if st.session_state.page > int(max_pages):
-            debug_log("Reached max_pages. Stopping.")
-            st.session_state.running = False
-
-        # 아직 running이면 자동으로 다음 tick 진행
-        if st.session_state.running:
-            status_box.warning("계속 수집 중... 잠시 후 자동으로 다음 페이지로 진행합니다.")
-            time.sleep(0.2)
-            st.rerun()
-        else:
-            # 끝났으면 드라이버 정리
-            try:
-                if st.session_state.driver is not None:
-                    st.session_state.driver.quit()
-            except Exception:
-                pass
-            st.session_state.driver = None
-            status_box.success(f"수집 완료: {len(st.session_state.collected)}개")
-
+        posts = collect_by_paging(
+            target_date=target_date,
+            headless=headless,
+            max_pages=int(max_pages),
+            stop_no_match_pages=int(stop_no_match_pages),
+            pause=float(pause),
+        )
+        st.session_state.posts = posts
+        st.success(f"수집 완료: {len(posts)}개 (✅ 선택한 날짜만)")
     except Exception:
-        st.session_state.last_error = traceback.format_exc()
-        debug_log("ERROR: " + st.session_state.last_error.splitlines()[-1] if st.session_state.last_error else "ERROR")
-        st.session_state.running = False
-        try:
-            if st.session_state.driver is not None:
-                st.session_state.driver.quit()
-        except Exception:
-            pass
-        st.session_state.driver = None
         st.error("수집 오류")
-        st.code(st.session_state.last_error)
+        st.code(traceback.format_exc())
 
-# ---- DataFrame
-df = pd.DataFrame(list(st.session_state.collected.values()))
-if not df.empty:
-    df = df.drop_duplicates(subset=["link"]).copy()
-    # date_raw가 시간/날짜 혼합이라 정렬은 문자열 기준
-    df = df.sort_values(by="date_raw", ascending=False)
+df = (
+    pd.DataFrame(st.session_state.posts)
+    if "posts" in st.session_state and st.session_state.posts
+    else pd.DataFrame(columns=["date", "date_raw", "date_detail", "author", "title", "title_norm", "link"])
+)
 
 author_dups = compute_author_dups(df)
 exact_dups = compute_exact_dups(df)
 keyword_groups = compute_keyword_groups(df, min_count=int(keyword_min_count))
 ai_similar = compute_ai_similar(df, threshold=float(sim_threshold))
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📌 원본", "🚨 작성자 동일", "🧨 제목 동일", "🔎 키워드 중복", "🤖 AI 유사", "🧪 디버그"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📌 원본", "🚨 작성자 동일", "🧨 제목 동일", "🔎 키워드 중복", "🤖 AI 유사"])
 
 with tab1:
     st.dataframe(df, use_container_width=True)
 
 with tab2:
-    st.dataframe(author_dups if not author_dups.empty else pd.DataFrame(), use_container_width=True)
     if author_dups.empty:
         st.info("해당 없음")
+    else:
+        st.dataframe(author_dups, use_container_width=True)
 
 with tab3:
-    st.dataframe(exact_dups if not exact_dups.empty else pd.DataFrame(), use_container_width=True)
     if exact_dups.empty:
         st.info("해당 없음")
+    else:
+        st.dataframe(exact_dups, use_container_width=True)
 
 with tab4:
-    st.dataframe(keyword_groups if not keyword_groups.empty else pd.DataFrame(), use_container_width=True)
     if keyword_groups.empty:
         st.info("해당 없음")
+    else:
+        st.dataframe(keyword_groups, use_container_width=True)
 
 with tab5:
-    st.dataframe(ai_similar if not ai_similar.empty else pd.DataFrame(), use_container_width=True)
     if ai_similar.empty:
         st.info("해당 없음")
-
-with tab6:
-    st.write("최근 디버그 이벤트(최대 300줄):")
-    st.code("\n".join(st.session_state.debug_events[-300:]) if st.session_state.debug_events else "(없음)")
-    if st.session_state.last_error:
-        st.write("마지막 오류:")
-        st.code(st.session_state.last_error)
+    else:
+        st.dataframe(ai_similar, use_container_width=True)
