@@ -1,5 +1,6 @@
 streamlit
 pandas
 scikit-learn
-selenium
-webdriver-manager
+requests
+beautifulsoup4
+lxml
