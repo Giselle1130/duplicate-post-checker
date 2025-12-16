@@ -1,5 +1,6 @@
 streamlit
 pandas
-requests
-beautifulsoup4
+selenium==4.27.1
 scikit-learn
+beautifulsoup4
+requests
