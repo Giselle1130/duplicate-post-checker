@@ -11,8 +11,9 @@ from bs4 import BeautifulSoup
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
+
 # ---------------------
-# KST 처리 (배포 환경 안전)
+# KST 처리 (배포 안전)
 # ---------------------
 try:
     from zoneinfo import ZoneInfo
@@ -22,7 +23,6 @@ except Exception:
 
 
 def kst_now() -> datetime:
-    # ZoneInfo가 있으면 사용, 없으면 UTC+9로 강제
     if KST:
         return datetime.now(KST)
     return datetime.utcnow() + timedelta(hours=9)
@@ -40,28 +40,46 @@ MENU_ID = 178
 BASE_URL = f"https://cafe.naver.com/f-e/cafes/{CLUB_ID}/menus/{MENU_ID}?viewType=L&page="
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/120.0.0.0 Safari/537.36",
     "Accept-Language": "ko-KR,ko;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Connection": "keep-alive",
 }
 
 
 # =====================
-# 날짜 판별 (목록 기준)
+# 날짜 텍스트 해석 -> 실제 날짜로 변환
 # =====================
+def infer_date_from_list_text(date_text: str) -> date_cls | None:
+    """
+    네이버 목록에 보이는 날짜 텍스트를 실제 날짜로 해석한다.
+    - HH:MM  -> 오늘(KST)
+    - YYYY.MM.DD -> 해당 날짜
+    (배포/로컬 표기 차이 모두 커버)
+    """
+    s = (date_text or "").strip()
+
+    # HH:MM 이면 오늘로 해석
+    if re.match(r"^\d{1,2}:\d{2}$", s):
+        return kst_today()
+
+    # YYYY.MM.DD 이면 파싱
+    m = re.match(r"^(\d{4})\.(\d{2})\.(\d{2})$", s)
+    if m:
+        y, mo, d = map(int, m.groups())
+        try:
+            return date_cls(y, mo, d)
+        except Exception:
+            return None
+
+    return None
+
+
 def is_target_date(date_text: str, target_date: date_cls) -> bool:
-    """
-    KST 기준:
-    - 선택 날짜가 '오늘'이면: 목록 날짜가 HH:MM 인 것만 수집
-    - 과거 날짜이면: 목록 날짜가 YYYY.MM.DD 정확히 일치만 수집
-    """
-    today_kst = kst_today()
-
-    # 오늘인 경우: HH:MM만 수집
-    if target_date == today_kst:
-        return bool(re.match(r"^\d{1,2}:\d{2}$", date_text))
-
-    # 과거 날짜: YYYY.MM.DD만 수집
-    return date_text == target_date.strftime("%Y.%m.%d")
+    inferred = infer_date_from_list_text(date_text)
+    return inferred == target_date
 
 
 # =====================
@@ -81,10 +99,6 @@ def normalize_title(s: str) -> str:
 
 
 def simple_tokens(s: str) -> list[str]:
-    """
-    아주 단순 토큰화(한/영/숫자만 남기고 분리)
-    - 키워드 중복용
-    """
     s = (s or "").lower()
     s = re.sub(r"[^0-9a-z가-힣 ]+", " ", s)
     parts = [p for p in s.split() if len(p) >= 2]
@@ -92,64 +106,99 @@ def simple_tokens(s: str) -> list[str]:
 
 
 # =====================
-# 목록 수집
+# 목록 수집 (강건 파싱 + 디버그)
 # =====================
-def collect_article_list(target_date: date_cls, max_pages: int = 30) -> list[dict]:
-    articles = []
-    target_str = target_date.strftime("%Y.%m.%d")
+def fetch_list_page(page: int):
+    url = BASE_URL + str(page)
+    res = requests.get(url, headers=HEADERS, timeout=25, allow_redirects=True)
+    return url, res
 
+
+def collect_article_list(target_date: date_cls, max_pages: int = 30, debug: bool = False):
+    articles = []
+
+    debug_log = []
     for page in range(1, max_pages + 1):
-        res = requests.get(BASE_URL + str(page), headers=HEADERS, timeout=20)
-        if res.status_code != 200:
+        url, res = fetch_list_page(page)
+
+        html = res.text or ""
+        soup = BeautifulSoup(html, "html.parser")
+
+        # ✅ 1) 가장 먼저 a.article를 찾고
+        links = soup.select("a.article")
+
+        # ✅ 2) 배포에서 구조가 다르면 /articles/ 링크를 추가로 잡는다
+        if not links:
+            links = [a for a in soup.select("a[href]") if "/articles/" in (a.get("href") or "")]
+
+        # 디버그: 페이지별 상태
+        if debug:
+            sample_dates = []
+            for dt in soup.select("td.td_date")[:5]:
+                sample_dates.append(dt.get_text(strip=True))
+            debug_log.append({
+                "page": page,
+                "status": res.status_code,
+                "final_url": res.url,
+                "found_links": len(links),
+                "sample_date_texts": ", ".join(sample_dates) if sample_dates else "(none)",
+                "html_head": html[:300].replace("\n", " ")  # 너무 길면 안 보여서 앞부분만
+            })
+
+        # 만약 링크 자체가 계속 0이면 → 더 페이지 돌려도 의미 없음(대개 차단/로그인/다른 HTML)
+        if page == 1 and not links:
             break
 
-        soup = BeautifulSoup(res.text, "html.parser")
-        rows = soup.select("tr")
-
-        stop_flag = False
-
-        for row in rows:
-            title_tag = row.select_one("a.article")
-            date_tag = row.select_one("td.td_date")
-            author_tag = row.select_one("td.td_name")  # 목록에서 보이는 작성자 (없을 수 있음)
-
-            if not title_tag or not date_tag:
-                continue
-
-            date_text = date_tag.get_text(strip=True)
-
-            # ✅ 날짜 필터는 "목록에서만" 적용
-            if not is_target_date(date_text, target_date):
-                # 과거 날짜 모드에서 더 옛날로 내려가면 중단 (YYYY.MM.DD 형태일 때만)
-                if re.match(r"^\d{4}\.\d{2}\.\d{2}$", date_text) and date_text < target_str:
-                    stop_flag = True
-                continue
-
-            href = title_tag.get("href", "")
+        for a in links:
+            href = a.get("href") or ""
             if not href:
                 continue
 
-            article_url = urljoin("https://cafe.naver.com", href)
-            title = title_tag.get_text(strip=True)
-            author = author_tag.get_text(strip=True) if author_tag else ""
+            # title
+            title = a.get_text(strip=True)
+            # 가끔 링크 텍스트가 빈 경우가 있어서 상위 요소에서 찾아보기
+            if not title:
+                title = a.get("title", "") or ""
 
-            articles.append(
-                {
-                    "date": target_date.strftime("%Y-%m-%d"),
-                    "date_raw": date_text,
-                    "author": author,
-                    "title": title,
-                    "title_norm": normalize_title(title),
-                    "link": article_url,
-                }
-            )
+            # date는 보통 같은 row(tr) 안 td.td_date
+            date_text = ""
+            row = a.find_parent("tr")
+            if row:
+                dt = row.select_one("td.td_date")
+                if dt:
+                    date_text = dt.get_text(strip=True)
 
-        if stop_flag:
-            break
+                # 작성자(있으면)
+                au = row.select_one("td.td_name")
+                author = au.get_text(strip=True) if au else ""
+            else:
+                author = ""
+
+            # 날짜 텍스트가 못 잡혔을 때: 페이지 내 첫 td.td_date를 “근처”에서라도 시도
+            if not date_text:
+                near = a.find_parent()
+                if near:
+                    dt2 = near.select_one("td.td_date") if hasattr(near, "select_one") else None
+                    if dt2:
+                        date_text = dt2.get_text(strip=True)
+
+            # ✅ 날짜 필터
+            if not is_target_date(date_text, target_date):
+                continue
+
+            full_url = urljoin("https://cafe.naver.com", href)
+            articles.append({
+                "date": target_date.strftime("%Y-%m-%d"),
+                "date_raw": date_text,
+                "author": author,
+                "title": title,
+                "title_norm": normalize_title(title),
+                "link": full_url,
+            })
 
         time.sleep(0.25)
 
-    return articles
+    return articles, debug_log
 
 
 # =====================
@@ -172,20 +221,17 @@ def fetch_content(url: str) -> str:
 
         content = soup.select_one("div.se-main-container")
         if not content:
-            # 구형 에디터 fallback
             content = soup.select_one("div#postViewArea") or soup.select_one("div.ContentRenderer")
-
         if not content:
             return ""
 
         return content.get_text(" ", strip=True)
-
     except Exception:
         return ""
 
 
 # =====================
-# 중복 판정들
+# 중복 판정
 # =====================
 def dup_by_author(df: pd.DataFrame):
     groups = df[df["author"].astype(str).str.len() > 0].groupby("author").indices
@@ -214,8 +260,7 @@ def dup_by_title(df: pd.DataFrame):
 def dup_by_keywords(df: pd.DataFrame, jaccard_threshold: float = 0.6):
     token_sets = []
     for _, r in df.iterrows():
-        tokens = simple_tokens(f"{r.get('title','')} {r.get('content','')}")
-        token_sets.append(set(tokens))
+        token_sets.append(set(simple_tokens(f"{r.get('title','')} {r.get('content','')}")))
 
     pairs = []
     n = len(token_sets)
@@ -240,7 +285,6 @@ def dup_by_ai(df: pd.DataFrame, threshold: float = 0.7):
         tfidf = vectorizer.fit_transform(texts)
 
     sim = cosine_similarity(tfidf)
-
     pairs = []
     for i in range(len(sim)):
         for j in range(i + 1, len(sim)):
@@ -252,20 +296,18 @@ def dup_by_ai(df: pd.DataFrame, threshold: float = 0.7):
 def build_pairs_table(df: pd.DataFrame, pairs: list[tuple]):
     rows = []
     for i, j, score, reason in pairs:
-        rows.append(
-            {
-                "A_idx": i,
-                "A_title": df.loc[i, "title"],
-                "A_author": df.loc[i, "author"],
-                "A_link": df.loc[i, "link"],
-                "B_idx": j,
-                "B_title": df.loc[j, "title"],
-                "B_author": df.loc[j, "author"],
-                "B_link": df.loc[j, "link"],
-                "score": round(float(score), 3),
-                "reason": reason,
-            }
-        )
+        rows.append({
+            "A_idx": i,
+            "A_title": df.loc[i, "title"],
+            "A_author": df.loc[i, "author"],
+            "A_link": df.loc[i, "link"],
+            "B_idx": j,
+            "B_title": df.loc[j, "title"],
+            "B_author": df.loc[j, "author"],
+            "B_link": df.loc[j, "link"],
+            "score": round(float(score), 3),
+            "reason": reason,
+        })
     return pd.DataFrame(rows)
 
 
@@ -273,19 +315,11 @@ def build_pairs_table(df: pd.DataFrame, pairs: list[tuple]):
 # Streamlit UI
 # =====================
 st.set_page_config(page_title="클랜/방송/디스코드 중복검사", layout="wide")
-
-st.markdown(
-    """
-<style>
-.block-container {max-width: 1400px;}
-</style>
-""",
-    unsafe_allow_html=True,
-)
+st.markdown("<style>.block-container{max-width:1400px;}</style>", unsafe_allow_html=True)
 
 st.title("📌 클랜/방송/디스코드 중복검사")
 
-# --- 상단 토글 버튼 ---
+# 상단 토글
 colA, colB, colC, colD, colE = st.columns([1, 1, 1, 1, 1])
 with colA:
     opt_original = st.toggle("📌 원본", value=True)
@@ -301,16 +335,17 @@ with colE:
 st.divider()
 
 left, right = st.columns([1, 1])
-
 with left:
     target_date = st.date_input("📅 수집 날짜 선택 (KST 기준)", kst_today())
-
 with right:
-    max_pages = st.number_input("📄 최대 페이지 수", min_value=1, max_value=200, value=10, step=1)
+    max_pages = st.number_input("📄 최대 페이지 수", 1, 200, 10, 1)
 
 with st.expander("⚙️ 중복 판정 옵션", expanded=False):
     ai_threshold = st.slider("🤖 AI 유사 임계치 (cosine)", 0.1, 0.99, 0.70, 0.01)
     kw_threshold = st.slider("🔎 키워드 중복 임계치 (Jaccard)", 0.1, 0.99, 0.60, 0.01)
+
+with st.expander("🧪 디버그 (배포에서 목록이 0개면 꼭 열어봐)", expanded=False):
+    debug_mode = st.checkbox("디버그 모드 켜기(페이지1 HTML/상태 표시)", value=False)
 
 st.divider()
 
@@ -321,10 +356,14 @@ run = st.button("📥 게시글 수집 시작", type="primary")
 
 if run:
     with st.spinner("게시글 목록 수집 중..."):
-        articles = collect_article_list(target_date, max_pages=int(max_pages))
+        articles, debug_log = collect_article_list(target_date, int(max_pages), debug=debug_mode)
+
+    if debug_mode:
+        st.subheader("🧪 디버그 로그")
+        st.dataframe(pd.DataFrame(debug_log), use_container_width=True)
 
     if not articles:
-        st.error("목록에서 해당 날짜 게시글을 찾지 못했어. (날짜/페이지 설정 확인)")
+        st.error("목록에서 해당 날짜 게시글을 찾지 못했어. (배포에서 목록 HTML이 다르게 내려오는지 디버그를 확인해줘)")
         st.stop()
 
     st.success(f"목록 수집 완료: {len(articles)}개")
@@ -338,11 +377,9 @@ if run:
 
     df = pd.DataFrame(articles)
     df["content"] = contents
-
     st.session_state["df"] = df
 
 df = st.session_state.get("df")
-
 if df is not None:
     st.subheader("✅ 수집 결과")
 
@@ -355,9 +392,9 @@ if df is not None:
     if opt_title:
         all_pairs += dup_by_title(df)
     if opt_keyword:
-        all_pairs += dup_by_keywords(df, jaccard_threshold=float(kw_threshold))
+        all_pairs += dup_by_keywords(df, float(kw_threshold))
     if opt_ai:
-        all_pairs += dup_by_ai(df, threshold=float(ai_threshold))
+        all_pairs += dup_by_ai(df, float(ai_threshold))
 
     if not (opt_author or opt_title or opt_keyword or opt_ai):
         st.info("중복 기준 버튼을 하나 이상 켜줘.")
@@ -367,16 +404,11 @@ if df is not None:
         merged = {}
         for i, j, score, reason in all_pairs:
             key = (min(i, j), max(i, j))
-            if key not in merged:
-                merged[key] = {"score": score, "reasons": [reason]}
-            else:
-                merged[key]["score"] = max(merged[key]["score"], score)
-                merged[key]["reasons"].append(reason)
+            merged.setdefault(key, {"score": 0.0, "reasons": []})
+            merged[key]["score"] = max(merged[key]["score"], float(score))
+            merged[key]["reasons"].append(reason)
 
-        final_pairs = []
-        for (i, j), v in merged.items():
-            final_pairs.append((i, j, v["score"], " / ".join(v["reasons"])))
-
+        final_pairs = [(i, j, v["score"], " / ".join(v["reasons"])) for (i, j), v in merged.items()]
         result_df = build_pairs_table(df, final_pairs).sort_values(["score"], ascending=False)
 
         st.subheader("⚠️ 중복 의심 결과")
