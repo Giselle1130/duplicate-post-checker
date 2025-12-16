@@ -1,8 +1,9 @@
+import os
 import re
 import time
 import traceback
 from datetime import datetime, date as date_cls
-from urllib.parse import urljoin
+from shutil import which
 
 import pandas as pd
 import streamlit as st
@@ -43,15 +44,13 @@ BASE_LIST_URL = (
     "&search.boardtype=L"
 )
 
-NAVER_BASE = "https://cafe.naver.com/"
-
-# 링크/onclick/데이터에서 글번호 뽑기
+# 글번호 추출: href / onclick / 데이터 다양한 케이스 지원
 ARTICLEID_RE = re.compile(
     r"(?:[?&]articleid=(\d+))|(?:/articles/(\d+))|(?:articleid[=:]\s*['\"]?(\d+))",
     re.IGNORECASE,
 )
 
-# 목록에서 글 링크 후보
+# 목록에서 글 링크 후보 (href/onclick/data-articleid 포함)
 LINK_CSS = (
     "a[href*='articleid='], a[href*='/articles/'], "
     "a[onclick*='articleid'], a[onclick*='/articles/'], "
@@ -97,8 +96,6 @@ def extract_date_token_any(text: str):
     m2 = re.search(r"\b(\d{2})\.(\d{2})\.?\b", t)
     if m2:
         mo, d = int(m2.group(1)), int(m2.group(2))
-        # 연도는 "선택한 target_date의 연도"로 맞춰 비교할 거라 여기선 (mo, d)만 리턴하지 않고 None 처리
-        # 실제 비교는 collect 루프에서 target_date.year로 date를 만들어 비교
         return ("MD", mo, d)
 
     return None
@@ -109,8 +106,7 @@ def build_page_url(page: int) -> str:
 
 
 def canonical_article_link(article_id: str) -> str:
-    # ✅ 중복제거 안정성 위해 글 링크를 "고정 형태"로 만들어 저장
-    # (목록 링크가 상대/JS/케이스 섞여도 같은 글이면 같은 링크가 됨)
+    # ✅ 같은 글이면 링크가 섞여도 동일하게 저장(중복 제거 안정)
     return f"https://cafe.naver.com/ca-fe/cafes/{CLUB_ID}/articles/{article_id}"
 
 
@@ -129,15 +125,29 @@ STOPWORDS = {
 
 def normalize_title(raw: str) -> str:
     t = clean(raw)
+
+    # 끝 댓글수 제거
     t = re.sub(r"\s*\[\s*\d+\s*\]\s*$", "", t)
     t = re.sub(r"\s*\(\s*\d+\s*\)\s*$", "", t)
+
+    # [Steam] 같은 태그 제거
     t = re.sub(r"\[[^\]]{1,30}\]", " ", t)
+
+    # LV / 나이/범위 패턴 제거
     t = re.sub(r"\bLv\.?\s*\d+\b", " ", t, flags=re.IGNORECASE)
     t = re.sub(r"\b\d{1,2}\s*~\s*\d{1,2}\b", " ", t)
     t = re.sub(r"\b\d{1,2}\s*세\b", " ", t)
+
+    # url 제거
     t = re.sub(r"https?://\S+", " ", t)
+
+    # 이모지/기호 제거 (한/영/숫자/공백만 유지)
     t = re.sub(r"[^0-9A-Za-z가-힣\s]", " ", t)
+
+    # 숫자 단독 제거
     t = re.sub(r"\b\d+\b", " ", t)
+
+    # 공백 정리
     t = re.sub(r"\s+", " ", t).strip().lower()
     return t
 
@@ -145,8 +155,38 @@ def normalize_title(raw: str) -> str:
 def tokenize(text: str):
     t = normalize_title(text)
     toks = re.findall(r"[a-z]+|[가-힣]+", t)
-    toks = [x for x in toks if len(x) >= 2 and x not in STOPWORDS]
+    toks = [x for x in toks if len(x) >= 2]
+    toks = [x for x in toks if x not in STOPWORDS]
     return toks
+
+
+# =========================
+# Chrome/Chromium 바이너리 탐지
+# =========================
+def _find_chrome_binary():
+    # 1) 사용자가 환경변수로 지정한 경우
+    env = os.environ.get("CHROME_BIN") or os.environ.get("GOOGLE_CHROME_BIN")
+    if env and os.path.exists(env):
+        return env
+
+    # 2) PATH 탐색
+    for name in ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"]:
+        p = which(name)
+        if p:
+            return p
+
+    # 3) 흔한 설치 경로
+    candidates = [
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/snap/bin/chromium",
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return None
 
 
 # =========================
@@ -158,29 +198,49 @@ def make_driver(headless: bool = True) -> webdriver.Chrome:
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--window-size=1400,900")
+
+    # ✅ 속도/안정
     opts.page_load_strategy = "eager"
 
     if headless:
         opts.add_argument("--headless=new")
+        # 일부 리눅스/WSL에서 도움이 되는 경우가 있음
+        opts.add_argument("--remote-debugging-port=0")
 
-    # 이미지 차단(속도↑)
+    # ✅ 이미지 차단(속도↑)
     opts.add_experimental_option("prefs", {
         "profile.managed_default_content_settings.images": 2,
         "profile.default_content_setting_values.notifications": 2,
     })
 
+    # ✅ 자동화 탐지 완화(가능한 범위)
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
 
-    if USE_WDM:
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=opts)
-    else:
-        driver = webdriver.Chrome(options=opts)
+    # ✅ 크롬/크로미움 경로 지정(없으면 드라이버가 바로 죽는 환경이 많음)
+    chrome_bin = _find_chrome_binary()
+    if chrome_bin:
+        opts.binary_location = chrome_bin
 
-    driver.implicitly_wait(0.4)
+    try:
+        if USE_WDM:
+            service = Service(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=opts)
+        else:
+            driver = webdriver.Chrome(options=opts)
+    except Exception as e:
+        msg = str(e)
+        hint = [
+            "크롬/크로미움 브라우저가 설치되어 있는지 확인해줘.",
+            "Ubuntu/WSL이면: sudo apt update && sudo apt install -y google-chrome-stable (또는 chromium-browser)",
+            "설치되어 있는데도 실패하면 CHROME_BIN 환경변수로 크롬 경로를 지정해줘. 예) export CHROME_BIN=/usr/bin/google-chrome",
+        ]
+        raise RuntimeError("ChromeDriver 실행 실패\n\n원인:\n" + msg + "\n\n해결:\n- " + "\n- ".join(hint))
 
+    driver.implicitly_wait(0.5)
+
+    # navigator.webdriver 숨김(가능한 범위)
     try:
         driver.execute_cdp_cmd(
             "Page.addScriptToEvaluateOnNewDocument",
@@ -193,6 +253,7 @@ def make_driver(headless: bool = True) -> webdriver.Chrome:
 
 
 def switch_to_cafe_main_iframe(driver) -> bool:
+    # 네이버 카페(클래식)는 cafe_main iframe에 목록이 뜨는 경우가 많음
     try:
         driver.switch_to.default_content()
         if driver.find_elements(By.ID, "cafe_main"):
@@ -204,23 +265,31 @@ def switch_to_cafe_main_iframe(driver) -> bool:
 
 
 def wait_list_loaded(driver):
+    """
+    ✅ 핵심: '글 링크'가 실제로 생길 때까지 기다림.
+    - iframe 안/밖 모두 체크
+    - link 패턴 다양한 케이스 허용
+    """
     wait = WebDriverWait(driver, 25)
 
-    def has_links(d):
+    def has_links_in_current_doc(d):
         return len(d.find_elements(By.CSS_SELECTOR, LINK_CSS)) > 0
 
+    # 1) iframe 먼저
     if switch_to_cafe_main_iframe(driver):
         try:
-            wait.until(has_links)
+            wait.until(has_links_in_current_doc)
             return
         except Exception:
             pass
 
+    # 2) default content에서 다시 체크
     try:
         driver.switch_to.default_content()
     except Exception:
         pass
-    wait.until(has_links)
+
+    wait.until(has_links_in_current_doc)
 
 
 def is_notice_row(row_text: str, row_el) -> bool:
@@ -241,7 +310,7 @@ def pick_row_author(row_text: str, title: str) -> str:
     lines = [x.strip() for x in t.split("\n") if x.strip()]
     lines = [x for x in lines if x != title]
     lines = [x for x in lines if not is_time_token(x)]
-    # 날짜 토큰 형태(연도 포함/미포함) 제거
+    # 날짜 토큰(연도 포함/미포함) 제거
     lines = [x for x in lines if not re.fullmatch(r"(20\d{2}\.\d{2}\.\d{2}\.?)|(\d{2}\.\d{2}\.?)", x)]
     bad = ["조회", "좋아요", "댓글", "댓글수"]
     lines = [x for x in lines if not any(b in x for b in bad)]
@@ -252,24 +321,23 @@ def pick_row_author(row_text: str, title: str) -> str:
     return ""
 
 
-def extract_article_id(row_el) -> str:
+def extract_article_id(el) -> str:
     """
     ✅ href가 비어있거나 javascript인 경우도 커버:
+    - data-articleid
     - href
     - onclick
-    - data-articleid
     """
     try:
-        # data-articleid
-        da = clean(row_el.get_attribute("data-articleid"))
+        da = clean(el.get_attribute("data-articleid"))
         if da.isdigit():
             return da
     except Exception:
         pass
 
     try:
-        href = clean(row_el.get_attribute("href"))
-        if href and "javascript" not in href.lower():
+        href = clean(el.get_attribute("href"))
+        if href:
             m = ARTICLEID_RE.search(href)
             if m:
                 return (m.group(1) or m.group(2) or m.group(3) or "").strip()
@@ -277,7 +345,7 @@ def extract_article_id(row_el) -> str:
         pass
 
     try:
-        onclick = clean(row_el.get_attribute("onclick"))
+        onclick = clean(el.get_attribute("onclick"))
         if onclick:
             m = ARTICLEID_RE.search(onclick)
             if m:
@@ -286,15 +354,6 @@ def extract_article_id(row_el) -> str:
         pass
 
     return ""
-
-
-def resolve_href(href: str) -> str:
-    href = clean(href)
-    if not href:
-        return ""
-    if href.lower().startswith("http"):
-        return href
-    return urljoin(NAVER_BASE, href)
 
 
 def collect_by_paging(
@@ -318,6 +377,7 @@ def collect_by_paging(
             wait_list_loaded(driver)
             time.sleep(pause)
 
+            # ✅ table/tr 우선, 없으면 li도 보조
             rows = driver.find_elements(By.CSS_SELECTOR, "tr")
             if len(rows) < 5:
                 rows = driver.find_elements(By.CSS_SELECTOR, "li") + rows
@@ -338,10 +398,9 @@ def collect_by_paging(
 
                     a = links[0]
 
-                    # 글번호 확보(가장 중요)
+                    # 글번호 확보(핵심)
                     article_id = extract_article_id(a)
                     if not article_id:
-                        # a에서 실패하면 row 전체에서 한번 더
                         article_id = extract_article_id(row)
                     if not article_id:
                         continue
@@ -354,22 +413,22 @@ def collect_by_paging(
                     if not title_raw:
                         continue
 
-                    # 시간/날짜 토큰
                     hhmm = extract_time_token(row_text)
                     dtok = extract_date_token_any(row_text)
 
                     if is_today:
-                        # 오늘: 시간형만
+                        # 오늘: 시간형만 수집
                         if not hhmm:
                             continue
                         date_raw = hhmm
-                        ok = True
                     else:
-                        # 과거: 날짜형만 (연도 포함/미포함 모두 허용)
+                        # 과거: 날짜형만 수집(연도 포함/미포함 모두 허용)
                         if hhmm:
                             continue
 
                         ok = False
+                        date_raw = ""
+
                         if isinstance(dtok, date_cls):
                             ok = (dtok == target_date)
                             date_raw = dtok.strftime("%Y.%m.%d")
@@ -381,14 +440,10 @@ def collect_by_paging(
                                 date_raw = d_obj.strftime("%Y.%m.%d")
                             except Exception:
                                 ok = False
-                                date_raw = ""
-                        else:
-                            date_raw = ""
 
                         if not ok:
                             continue
 
-                    # 링크: canonical로 고정 저장(중복 제거 안정)
                     link = canonical_article_link(article_id)
 
                     collected[link] = {
@@ -409,6 +464,7 @@ def collect_by_paging(
             else:
                 no_match_pages += 1
 
+            # ✅ 조기 종료
             if no_match_pages >= int(stop_no_match_pages):
                 break
 
@@ -447,10 +503,14 @@ def compute_exact_dups_cached(df: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def compute_keyword_groups_cached(df: pd.DataFrame, min_count: int = 2):
+    """
+    ✅ 같은 키워드가 2건 이상이면 중복으로 잡기(작성자 무관)
+    """
     if df.empty:
         return pd.DataFrame(columns=["keyword", "count", "examples"])
 
     tokens_list = [tokenize(x) for x in df["title"].fillna("").astype(str).tolist()]
+
     inv = {}
     for idx, toks in enumerate(tokens_list):
         for tok in set(toks):
@@ -474,11 +534,14 @@ def compute_keyword_groups_cached(df: pd.DataFrame, min_count: int = 2):
 
 @st.cache_data(show_spinner=False)
 def compute_ai_similar_cached(df: pd.DataFrame, threshold: float = 0.78, max_n: int = 250) -> pd.DataFrame:
+    """
+    ✅ 작성자 조건 제거: 선택 날짜 전체에서 유사도 비교
+    ✅ 렉 방지: max_n개만 비교(최신순 head)
+    """
     cols = ["title_a", "title_b", "similarity", "link_a", "link_b"]
     if df.empty or len(df) < 2:
         return pd.DataFrame(columns=cols)
 
-    # ✅ 렉 방지: 너무 많으면 최신순 max_n개만
     df2 = df.copy()
     if len(df2) > max_n:
         df2 = df2.head(max_n).copy()
@@ -489,12 +552,12 @@ def compute_ai_similar_cached(df: pd.DataFrame, threshold: float = 0.78, max_n: 
 
     vec_w = TfidfVectorizer(analyzer="word", ngram_range=(1, 2), min_df=1)
     Xw = vec_w.fit_transform(titles)
+    Mw = cosine_similarity(Xw)
 
     vec_c = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=1)
     Xc = vec_c.fit_transform(titles)
-
-    Mw = cosine_similarity(Xw)
     Mc = cosine_similarity(Xc)
+
     M = 0.55 * Mw + 0.45 * Mc
 
     rows = []
@@ -558,8 +621,9 @@ if st.button("수집 시작", use_container_width=True):
         )
         st.session_state.posts = posts
         st.success(f"수집 완료: {len(posts)}개")
-    except Exception:
+    except Exception as e:
         st.error("수집 오류")
+        st.code(str(e))
         st.code(traceback.format_exc())
 
 df = (
@@ -582,15 +646,27 @@ with tab1:
     st.dataframe(df, use_container_width=True)
 
 with tab2:
-    st.dataframe(author_dups if not author_dups.empty else pd.DataFrame({"info": ["해당 없음"]}), use_container_width=True)
+    if author_dups.empty:
+        st.info("해당 없음")
+    else:
+        st.dataframe(author_dups, use_container_width=True)
 
 with tab3:
-    st.dataframe(exact_dups if not exact_dups.empty else pd.DataFrame({"info": ["해당 없음"]}), use_container_width=True)
+    if exact_dups.empty:
+        st.info("해당 없음")
+    else:
+        st.dataframe(exact_dups, use_container_width=True)
 
 with tab4:
-    st.dataframe(keyword_groups if not keyword_groups.empty else pd.DataFrame({"info": ["해당 없음"]}), use_container_width=True)
+    if keyword_groups.empty:
+        st.info("해당 없음")
+    else:
+        st.dataframe(keyword_groups, use_container_width=True)
 
 with tab5:
     if not run_ai:
         st.info("AI 유사도는 무거워서 기본 OFF야. 위 설정에서 체크하면 계산해.")
-    st.dataframe(ai_similar if not ai_similar.empty else pd.DataFrame({"info": ["해당 없음"]}), use_container_width=True)
+    if ai_similar.empty:
+        st.info("해당 없음")
+    else:
+        st.dataframe(ai_similar, use_container_width=True)
