@@ -182,3 +182,204 @@ def collect_by_paging(target_date, headless, max_pages, pause, status_cb=None, p
 
             page_hit = 0
             oldest_seen = None
+
+            for row in rows:
+                try:
+                    row_text = clean(row.text)
+                    if not row_text or "공지" in row_text:
+                        continue
+
+                    links = row.find_elements(By.CSS_SELECTOR, LINK_CSS)
+                    if not links:
+                        continue
+
+                    a = links[0]
+                    href = clean(a.get_attribute("href"))
+                    if not href:
+                        continue
+
+                    article_id = extract_article_id_from_href(href)
+                    if not article_id:
+                        continue
+
+                    title = clean(a.text)
+                    if not title:
+                        lines = [x.strip() for x in row_text.split("\n") if x.strip()]
+                        title = lines[0] if lines else ""
+                    if not title:
+                        continue
+
+                    hhmm = extract_time_token(row_text)
+                    dot = extract_date_token(row_text)
+
+                    if is_today:
+                        if not hhmm:
+                            continue
+                        date_raw = hhmm
+                    else:
+                        if hhmm:
+                            continue
+                        if not dot or dot != target_dot:
+                            continue
+                        d_obj = parse_dot_date(dot)
+                        if d_obj:
+                            oldest_seen = d_obj if (oldest_seen is None or d_obj < oldest_seen) else oldest_seen
+                        date_raw = dot
+
+                    link = f"https://cafe.naver.com/ca-fe/cafes/{CLUB_ID}/articles/{article_id}"
+                    collected[link] = {
+                        "date": target_iso,
+                        "date_raw": date_raw,
+                        "author": "",
+                        "title": title,
+                        "title_norm": normalize_title(title),
+                        "link": link,
+                    }
+                    page_hit += 1
+                except Exception:
+                    continue
+
+            # 조기 종료
+            if (not is_today) and oldest_seen and oldest_seen < target_date:
+                break
+            if (not is_today) and page >= 3 and page_hit == 0:
+                break
+
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+    df = pd.DataFrame(list(collected.values()))
+    if not df.empty:
+        df = df.drop_duplicates(subset=["link"]).copy()
+        df = df.sort_values(by="date_raw", ascending=False)
+    return df
+
+
+def compute_exact_dups(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=df.columns)
+    return df[df.duplicated(subset=["date", "title_norm"], keep=False)].copy()
+
+
+def compute_keyword_groups(df: pd.DataFrame, min_count: int = 2):
+    if df.empty:
+        return pd.DataFrame(columns=["keyword", "count", "examples"])
+
+    tokens_list = [tokenize(x) for x in df["title"].fillna("").astype(str).tolist()]
+    inv = {}
+    for idx, toks in enumerate(tokens_list):
+        for tok in set(toks):
+            inv.setdefault(tok, []).append(idx)
+
+    rows = []
+    for kw, idxs in inv.items():
+        if len(idxs) >= min_count:
+            ex = [df.iloc[i]["title"] for i in idxs[:3]]
+            rows.append({"keyword": kw, "count": len(idxs), "examples": " | ".join(ex)})
+
+    out = pd.DataFrame(rows)
+    return out.sort_values(by=["count", "keyword"], ascending=[False, True]) if not out.empty else out
+
+
+def compute_ai_similar(df: pd.DataFrame, threshold: float = 0.78, max_n: int = 250) -> pd.DataFrame:
+    cols = ["title_a", "title_b", "similarity", "link_a", "link_b"]
+    if df.empty or len(df) < 2:
+        return pd.DataFrame(columns=cols)
+
+    df2 = df.head(max_n).copy()
+    titles_raw = df2["title"].fillna("").astype(str).tolist()
+    titles = df2["title_norm"].fillna("").astype(str).tolist()
+    links = df2["link"].fillna("").astype(str).tolist()
+
+    vec_w = TfidfVectorizer(analyzer="word", ngram_range=(1, 2), min_df=1)
+    Xw = vec_w.fit_transform(titles)
+    Mw = cosine_similarity(Xw)
+
+    vec_c = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=1)
+    Xc = vec_c.fit_transform(titles)
+    Mc = cosine_similarity(Xc)
+
+    M = 0.55 * Mw + 0.45 * Mc
+
+    rows = []
+    n = len(titles)
+    for i in range(n):
+        for j in range(i + 1, n):
+            s = float(M[i, j])
+            if s >= threshold:
+                rows.append({
+                    "title_a": titles_raw[i],
+                    "title_b": titles_raw[j],
+                    "similarity": round(s, 3),
+                    "link_a": links[i],
+                    "link_b": links[j],
+                })
+
+    out = pd.DataFrame(rows, columns=cols)
+    return out.sort_values(by="similarity", ascending=False) if not out.empty else out
+
+
+# =========================
+# UI
+# =========================
+st.set_page_config(page_title="클랜/방송/디스코드 중복 게시글 체크", layout="wide")
+st.title("🏰 클랜/방송/디스코드 중복 게시글 체크")
+
+with st.expander("설정", expanded=True):
+    c1, c2, c3, c4 = st.columns([1.4, 1, 1, 1])
+    with c1:
+        target_date = st.date_input("날짜 선택", value=kst_today())
+    with c2:
+        headless = st.checkbox("헤드리스", value=True)
+    with c3:
+        max_pages = st.number_input("최대 페이지", 1, 500, 120, step=10)
+    with c4:
+        pause = st.number_input("대기(초)", 0.0, 2.0, 0.15, step=0.05)
+
+sim_threshold = st.slider("AI 유사도 기준", 0.50, 0.99, 0.78, 0.01)
+keyword_min_count = st.number_input("키워드 중복 최소 건수", 2, 20, 2)
+
+st.divider()
+
+if st.button("수집 시작", use_container_width=True):
+    try:
+        status = st.empty()
+        prog = st.progress(0.0)
+
+        df = collect_by_paging(
+            target_date=target_date,
+            headless=headless,
+            max_pages=int(max_pages),
+            pause=float(pause),
+            status_cb=lambda m: status.info(m),
+            prog_cb=lambda v: prog.progress(min(max(v, 0.0), 1.0)),
+        )
+
+        status.empty()
+        prog.empty()
+
+        st.success(f"수집 완료: {len(df)}개")
+
+        tab1, tab2, tab3, tab4 = st.tabs(["📌 원본", "🧨 제목 동일", "🔎 키워드 중복", "🤖 AI 유사"])
+
+        with tab1:
+            st.dataframe(df, use_container_width=True)
+
+        with tab2:
+            exact = compute_exact_dups(df)
+            st.dataframe(exact, use_container_width=True) if not exact.empty else st.info("해당 없음")
+
+        with tab3:
+            kw = compute_keyword_groups(df, min_count=int(keyword_min_count))
+            st.dataframe(kw, use_container_width=True) if not kw.empty else st.info("해당 없음")
+
+        with tab4:
+            sim = compute_ai_similar(df, threshold=float(sim_threshold))
+            st.dataframe(sim, use_container_width=True) if not sim.empty else st.info("해당 없음")
+
+    except Exception:
+        st.error("수집 오류")
+        st.code(traceback.format_exc())
