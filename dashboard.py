@@ -13,7 +13,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 
 # ---------------------
-# KST 처리 (배포 안전)
+# KST (배포 안전)
 # ---------------------
 try:
     from zoneinfo import ZoneInfo
@@ -39,10 +39,12 @@ CLUB_ID = 28866679
 MENU_ID = 178
 BASE_URL = f"https://cafe.naver.com/f-e/cafes/{CLUB_ID}/menus/{MENU_ID}?viewType=L&page="
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/120.0.0.0 Safari/537.36",
+BASE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
     "Accept-Language": "ko-KR,ko;q=0.9",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Connection": "keep-alive",
@@ -50,22 +52,41 @@ HEADERS = {
 
 
 # =====================
-# 날짜 텍스트 해석 -> 실제 날짜로 변환
+# ✅ 네이버 로그인(쿠키) 적용 헤더
+# =====================
+def get_headers() -> dict:
+    headers = BASE_HEADERS.copy()
+
+    # 1) secrets 우선 (Render 환경변수/Streamlit secrets로 넣을 수 있음)
+    nid_aut = st.secrets.get("NID_AUT", "") if hasattr(st, "secrets") else ""
+    nid_ses = st.secrets.get("NID_SES", "") if hasattr(st, "secrets") else ""
+
+    # 2) UI 입력값(세션) 있으면 덮어쓰기
+    cookie = st.session_state.get("naver_cookie", "")
+    if cookie:
+        headers["Cookie"] = cookie
+        return headers
+
+    # 3) secrets가 있으면 cookie 구성
+    if nid_aut and nid_ses:
+        headers["Cookie"] = f"NID_AUT={nid_aut}; NID_SES={nid_ses}"
+        return headers
+
+    # 4) 쿠키 없으면 그냥 반환 (배포에서는 막힐 수 있음)
+    return headers
+
+
+# =====================
+# 날짜 텍스트 해석 (오늘/과거 통일)
 # =====================
 def infer_date_from_list_text(date_text: str) -> date_cls | None:
-    """
-    네이버 목록에 보이는 날짜 텍스트를 실제 날짜로 해석한다.
-    - HH:MM  -> 오늘(KST)
-    - YYYY.MM.DD -> 해당 날짜
-    (배포/로컬 표기 차이 모두 커버)
-    """
     s = (date_text or "").strip()
 
-    # HH:MM 이면 오늘로 해석
+    # HH:MM => 오늘(KST)
     if re.match(r"^\d{1,2}:\d{2}$", s):
         return kst_today()
 
-    # YYYY.MM.DD 이면 파싱
+    # YYYY.MM.DD => 해당 날짜
     m = re.match(r"^(\d{4})\.(\d{2})\.(\d{2})$", s)
     if m:
         y, mo, d = map(int, m.groups())
@@ -101,52 +122,49 @@ def normalize_title(s: str) -> str:
 def simple_tokens(s: str) -> list[str]:
     s = (s or "").lower()
     s = re.sub(r"[^0-9a-z가-힣 ]+", " ", s)
-    parts = [p for p in s.split() if len(p) >= 2]
-    return parts
+    return [p for p in s.split() if len(p) >= 2]
 
 
 # =====================
-# 목록 수집 (강건 파싱 + 디버그)
+# 목록/본문 수집
 # =====================
 def fetch_list_page(page: int):
     url = BASE_URL + str(page)
-    res = requests.get(url, headers=HEADERS, timeout=25, allow_redirects=True)
+    res = requests.get(url, headers=get_headers(), timeout=25, allow_redirects=True)
     return url, res
 
 
-def collect_article_list(target_date: date_cls, max_pages: int = 30, debug: bool = False):
+def collect_article_list(target_date: date_cls, max_pages: int, debug: bool = False):
     articles = []
-
     debug_log = []
+
     for page in range(1, max_pages + 1):
         url, res = fetch_list_page(page)
-
         html = res.text or ""
         soup = BeautifulSoup(html, "html.parser")
 
-        # ✅ 1) 가장 먼저 a.article를 찾고
+        # 1) 우선 a.article
         links = soup.select("a.article")
 
-        # ✅ 2) 배포에서 구조가 다르면 /articles/ 링크를 추가로 잡는다
+        # 2) 없으면 /articles/ 포함 링크로 fallback
         if not links:
             links = [a for a in soup.select("a[href]") if "/articles/" in (a.get("href") or "")]
 
-        # 디버그: 페이지별 상태
         if debug:
-            sample_dates = []
-            for dt in soup.select("td.td_date")[:5]:
-                sample_dates.append(dt.get_text(strip=True))
-            debug_log.append({
-                "page": page,
-                "status": res.status_code,
-                "final_url": res.url,
-                "found_links": len(links),
-                "sample_date_texts": ", ".join(sample_dates) if sample_dates else "(none)",
-                "html_head": html[:300].replace("\n", " ")  # 너무 길면 안 보여서 앞부분만
-            })
+            sample_dates = [dt.get_text(strip=True) for dt in soup.select("td.td_date")[:10]]
+            debug_log.append(
+                {
+                    "page": page,
+                    "status": res.status_code,
+                    "final_url": res.url,
+                    "found_links": len(links),
+                    "sample_date_texts": ", ".join(sample_dates) if sample_dates else "(none)",
+                    "html_head": html[:400].replace("\n", " "),
+                }
+            )
 
-        # 만약 링크 자체가 계속 0이면 → 더 페이지 돌려도 의미 없음(대개 차단/로그인/다른 HTML)
-        if page == 1 and not links:
+        # ✅ 1페이지부터 링크가 0개면: 차단/빈 HTML 가능성이 매우 큼 → 더 돌려도 소용 없음
+        if page == 1 and len(links) == 0:
             break
 
         for a in links:
@@ -154,31 +172,26 @@ def collect_article_list(target_date: date_cls, max_pages: int = 30, debug: bool
             if not href:
                 continue
 
-            # title
-            title = a.get_text(strip=True)
-            # 가끔 링크 텍스트가 빈 경우가 있어서 상위 요소에서 찾아보기
-            if not title:
-                title = a.get("title", "") or ""
+            title = a.get_text(strip=True) or a.get("title", "") or ""
 
-            # date는 보통 같은 row(tr) 안 td.td_date
+            # date/author는 보통 같은 tr 안에 있음
             date_text = ""
+            author = ""
+
             row = a.find_parent("tr")
             if row:
                 dt = row.select_one("td.td_date")
                 if dt:
                     date_text = dt.get_text(strip=True)
-
-                # 작성자(있으면)
                 au = row.select_one("td.td_name")
-                author = au.get_text(strip=True) if au else ""
-            else:
-                author = ""
+                if au:
+                    author = au.get_text(strip=True)
 
-            # 날짜 텍스트가 못 잡혔을 때: 페이지 내 첫 td.td_date를 “근처”에서라도 시도
+            # 날짜 못 잡았으면 주변에서 한번 더
             if not date_text:
                 near = a.find_parent()
-                if near:
-                    dt2 = near.select_one("td.td_date") if hasattr(near, "select_one") else None
+                if hasattr(near, "select_one"):
+                    dt2 = near.select_one("td.td_date")
                     if dt2:
                         date_text = dt2.get_text(strip=True)
 
@@ -187,34 +200,35 @@ def collect_article_list(target_date: date_cls, max_pages: int = 30, debug: bool
                 continue
 
             full_url = urljoin("https://cafe.naver.com", href)
-            articles.append({
-                "date": target_date.strftime("%Y-%m-%d"),
-                "date_raw": date_text,
-                "author": author,
-                "title": title,
-                "title_norm": normalize_title(title),
-                "link": full_url,
-            })
+
+            articles.append(
+                {
+                    "date": target_date.strftime("%Y-%m-%d"),
+                    "date_raw": date_text,
+                    "author": author,
+                    "title": title,
+                    "title_norm": normalize_title(title),
+                    "link": full_url,
+                }
+            )
 
         time.sleep(0.25)
 
     return articles, debug_log
 
 
-# =====================
-# 본문 수집
-# =====================
 def fetch_content(url: str) -> str:
     try:
-        res = requests.get(url, headers=HEADERS, timeout=25)
+        res = requests.get(url, headers=get_headers(), timeout=25, allow_redirects=True)
         if res.status_code != 200:
             return ""
+
         soup = BeautifulSoup(res.text, "html.parser")
 
         iframe = soup.select_one("iframe#cafe_main")
         if iframe and iframe.get("src"):
             iframe_url = urljoin("https://cafe.naver.com", iframe["src"])
-            res2 = requests.get(iframe_url, headers=HEADERS, timeout=25)
+            res2 = requests.get(iframe_url, headers=get_headers(), timeout=25, allow_redirects=True)
             if res2.status_code != 200:
                 return ""
             soup = BeautifulSoup(res2.text, "html.parser")
@@ -226,6 +240,7 @@ def fetch_content(url: str) -> str:
             return ""
 
         return content.get_text(" ", strip=True)
+
     except Exception:
         return ""
 
@@ -296,28 +311,75 @@ def dup_by_ai(df: pd.DataFrame, threshold: float = 0.7):
 def build_pairs_table(df: pd.DataFrame, pairs: list[tuple]):
     rows = []
     for i, j, score, reason in pairs:
-        rows.append({
-            "A_idx": i,
-            "A_title": df.loc[i, "title"],
-            "A_author": df.loc[i, "author"],
-            "A_link": df.loc[i, "link"],
-            "B_idx": j,
-            "B_title": df.loc[j, "title"],
-            "B_author": df.loc[j, "author"],
-            "B_link": df.loc[j, "link"],
-            "score": round(float(score), 3),
-            "reason": reason,
-        })
+        rows.append(
+            {
+                "A_idx": i,
+                "A_title": df.loc[i, "title"],
+                "A_author": df.loc[i, "author"],
+                "A_link": df.loc[i, "link"],
+                "B_idx": j,
+                "B_title": df.loc[j, "title"],
+                "B_author": df.loc[j, "author"],
+                "B_link": df.loc[j, "link"],
+                "score": round(float(score), 3),
+                "reason": reason,
+            }
+        )
     return pd.DataFrame(rows)
 
 
 # =====================
-# Streamlit UI
+# UI
 # =====================
 st.set_page_config(page_title="클랜/방송/디스코드 중복검사", layout="wide")
 st.markdown("<style>.block-container{max-width:1400px;}</style>", unsafe_allow_html=True)
 
 st.title("📌 클랜/방송/디스코드 중복검사")
+
+# ✅ 로그인(쿠키) 입력 영역
+st.subheader("🔐 네이버 로그인 (쿠키 입력)")
+with st.expander("쿠키 입력 방법 / 입력칸 열기", expanded=True):
+    st.markdown(
+        """
+**중요:** ID/비밀번호 입력이 아니라, **로그인된 쿠키 값만 붙여넣는 방식**이야.
+
+### 쿠키 복사하는 방법 (PC 크롬 기준)
+1) 네이버 카페에 접속해서 **로그인**
+2) 키보드 `F12` (개발자도구) 열기
+3) 위 탭에서 **Application(애플리케이션)** 선택  
+   - 안 보이면 `>>` 누르고 찾기
+4) 왼쪽 메뉴에서 **Cookies → https://cafe.naver.com**
+5) 오른쪽 표에서 아래 2개를 찾아서 **Value를 복사**
+   - `NID_AUT`
+   - `NID_SES`
+
+복사한 값은 아래 칸에 붙여넣기만 하면 돼.
+        """
+    )
+
+    nid_aut_in = st.text_input("NID_AUT 값", type="password")
+    nid_ses_in = st.text_input("NID_SES 값", type="password")
+
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        if st.button("✅ 쿠키 저장"):
+            if not nid_aut_in or not nid_ses_in:
+                st.error("NID_AUT, NID_SES 둘 다 입력해야 해.")
+            else:
+                st.session_state["naver_cookie"] = f"NID_AUT={nid_aut_in}; NID_SES={nid_ses_in}"
+                st.success("저장 완료! 이제 수집이 가능해.")
+    with col2:
+        if st.button("🧹 쿠키 삭제"):
+            st.session_state.pop("naver_cookie", None)
+            st.success("쿠키 삭제 완료.")
+
+cookie_ready = bool(st.session_state.get("naver_cookie")) or (
+    hasattr(st, "secrets") and st.secrets.get("NID_AUT", "") and st.secrets.get("NID_SES", "")
+)
+
+if not cookie_ready:
+    st.warning("⚠️ Render 배포에서는 쿠키가 없으면 목록이 0개로 나올 수 있어. (네이버가 서버 IP를 막는 경우)")
+st.divider()
 
 # 상단 토글
 colA, colB, colC, colD, colE = st.columns([1, 1, 1, 1, 1])
@@ -344,8 +406,8 @@ with st.expander("⚙️ 중복 판정 옵션", expanded=False):
     ai_threshold = st.slider("🤖 AI 유사 임계치 (cosine)", 0.1, 0.99, 0.70, 0.01)
     kw_threshold = st.slider("🔎 키워드 중복 임계치 (Jaccard)", 0.1, 0.99, 0.60, 0.01)
 
-with st.expander("🧪 디버그 (배포에서 목록이 0개면 꼭 열어봐)", expanded=False):
-    debug_mode = st.checkbox("디버그 모드 켜기(페이지1 HTML/상태 표시)", value=False)
+with st.expander("🧪 디버그 (배포에서 0개면 확인)", expanded=False):
+    debug_mode = st.checkbox("디버그 모드 켜기(페이지 상태/HTML 일부 표시)", value=False)
 
 st.divider()
 
@@ -355,6 +417,10 @@ if "df" not in st.session_state:
 run = st.button("📥 게시글 수집 시작", type="primary")
 
 if run:
+    if not cookie_ready:
+        st.error("Render 배포에서는 쿠키 없이 수집이 막힐 가능성이 매우 높아. 위에서 쿠키를 저장하고 다시 눌러줘.")
+        st.stop()
+
     with st.spinner("게시글 목록 수집 중..."):
         articles, debug_log = collect_article_list(target_date, int(max_pages), debug=debug_mode)
 
@@ -363,7 +429,7 @@ if run:
         st.dataframe(pd.DataFrame(debug_log), use_container_width=True)
 
     if not articles:
-        st.error("목록에서 해당 날짜 게시글을 찾지 못했어. (배포에서 목록 HTML이 다르게 내려오는지 디버그를 확인해줘)")
+        st.error("목록에서 해당 날짜 게시글을 찾지 못했어. (쿠키가 만료됐거나, 네이버가 차단/HTML 변경 가능)")
         st.stop()
 
     st.success(f"목록 수집 완료: {len(articles)}개")
