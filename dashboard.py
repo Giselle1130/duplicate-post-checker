@@ -30,7 +30,7 @@ except Exception:
 
 
 # =========================
-# Streamlit 기본 설정 (✅ 1번만!)
+# Streamlit 기본 설정
 # =========================
 st.set_page_config(page_title="🏰 클랜/방송/디스코드 중복 게시글 체크", layout="wide")
 st.title("🏰 클랜/방송/디스코드 중복 게시글 체크")
@@ -42,7 +42,6 @@ st.title("🏰 클랜/방송/디스코드 중복 게시글 체크")
 CLUB_ID = 28866679
 MENU_ID = 178
 
-# ✅ 안정적인 "클래식 목록"으로 진입
 BASE_LIST_URL = (
     "https://cafe.naver.com/ArticleList.nhn"
     f"?search.clubid={CLUB_ID}"
@@ -53,11 +52,10 @@ BASE_LIST_URL = (
 ARTICLEID_RE = re.compile(r"(?:[?&]articleid=(\d+))|(?:/articles/(\d+))")
 LINK_CSS = "a[href*='articleid='], a[href*='/articles/']"
 
-# 상세에서 작성일 후보 셀렉터들 (UI가 바뀌어도 버티게 여러 개)
 DETAIL_DATE_SELECTORS = [
-    "span.date",                 # 구형
+    "span.date",
     ".article_info .date",
-    ".ArticleTopInfo__date",     # 신형
+    ".ArticleTopInfo__date",
     ".ArticleTopInfo .date",
     "p.date",
     "span._articleTime",
@@ -91,15 +89,31 @@ def extract_date_token(text: str) -> str:
     return m.group(1) if m else ""
 
 
-def parse_dot_date(s: str):
-    try:
-        return datetime.strptime(s, "%Y.%m.%d").date()
-    except Exception:
-        return None
-
-
 def build_page_url(page: int) -> str:
     return f"{BASE_LIST_URL}&search.page={page}"
+
+
+def parse_detail_datetime_text(raw: str):
+    s = clean(raw)
+
+    m = re.search(r"(\d{4})\.(\d{1,2})\.(\d{1,2})\.\s*(\d{1,2}):(\d{2})", s)
+    if m:
+        y, mo, d, hh, mm = map(int, m.groups())
+        return datetime(y, mo, d, hh, mm)
+
+    m = re.search(r"(\d{4})\.(\d{1,2})\.(\d{1,2})\.\s*(오전|오후)\s*(\d{1,2}):(\d{2})", s)
+    if m:
+        y, mo, d = map(int, m.group(1, 2, 3))
+        ampm = m.group(4)
+        hh = int(m.group(5))
+        mm = int(m.group(6))
+        if ampm == "오후" and hh != 12:
+            hh += 12
+        if ampm == "오전" and hh == 12:
+            hh = 0
+        return datetime(y, mo, d, hh, mm)
+
+    return None
 
 
 # =========================
@@ -194,24 +208,20 @@ def switch_to_cafe_main_iframe(driver) -> bool:
 
 
 def wait_list_loaded(driver):
-    wait = WebDriverWait(driver, 25)
+    wait = WebDriverWait(driver, 20)
 
-    def has_links_in_current_doc(d):
+    def has_links(d):
         return len(d.find_elements(By.CSS_SELECTOR, LINK_CSS)) > 0
 
     if switch_to_cafe_main_iframe(driver):
         try:
-            wait.until(has_links_in_current_doc)
+            wait.until(has_links)
             return
         except Exception:
             pass
 
-    try:
-        driver.switch_to.default_content()
-    except Exception:
-        pass
-
-    wait.until(has_links_in_current_doc)
+    driver.switch_to.default_content()
+    wait.until(has_links)
 
 
 def is_notice_row(row_text: str, row_el) -> bool:
@@ -249,50 +259,14 @@ def extract_article_id_from_href(href: str) -> str:
     return m.group(1) or m.group(2) or ""
 
 
-def parse_detail_datetime_text(raw: str):
-    """
-    상세의 작성일 텍스트를 최대한 안전하게 파싱
-    예)
-    - 2025.12.16. 23:58
-    - 2025.12.16. 오후 11:58
-    """
-    s = clean(raw)
-
-    m = re.search(r"(\d{4})\.(\d{1,2})\.(\d{1,2})\.\s*(\d{1,2}):(\d{2})", s)
-    if m:
-        y, mo, d, hh, mm = map(int, m.groups())
-        return datetime(y, mo, d, hh, mm)
-
-    m = re.search(r"(\d{4})\.(\d{1,2})\.(\d{1,2})\.\s*(오전|오후)\s*(\d{1,2}):(\d{2})", s)
-    if m:
-        y, mo, d = map(int, m.group(1, 2, 3))
-        ampm = m.group(4)
-        hh = int(m.group(5))
-        mm = int(m.group(6))
-        if ampm == "오후" and hh != 12:
-            hh += 12
-        if ampm == "오전" and hh == 12:
-            hh = 0
-        return datetime(y, mo, d, hh, mm)
-
-    return None
-
-
 def get_article_datetime_strict(driver, href: str, pause: float = 0.05):
-    """
-    ✅ 핵심: 글 상세 들어가서 '진짜 작성일' 얻기
-    - iframe 전환 포함
-    - 여러 셀렉터 시도 + 소스 정규식 백업
-    """
     try:
         driver.get(href)
         time.sleep(pause)
 
-        # 상세도 cafe_main iframe인 경우가 많음
         switch_to_cafe_main_iframe(driver)
-        wait = WebDriverWait(driver, 15)
+        wait = WebDriverWait(driver, 12)
 
-        # 1) 셀렉터로 찾기
         for css in DETAIL_DATE_SELECTORS:
             try:
                 el = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, css)))
@@ -302,7 +276,6 @@ def get_article_datetime_strict(driver, href: str, pause: float = 0.05):
             except Exception:
                 continue
 
-        # 2) 백업: page_source에서 날짜 패턴 찾기
         src = driver.page_source
         m = re.search(r"(\d{4}\.\d{1,2}\.\d{1,2}\.\s*(?:오전|오후)\s*\d{1,2}:\d{2})", src)
         if m:
@@ -321,44 +294,126 @@ def get_article_datetime_strict(driver, href: str, pause: float = 0.05):
     return None
 
 
-def collect_by_paging(
-    target_date: date_cls,
-    headless: bool,
-    max_pages: int,
-    stop_no_match_pages: int,
-    pause: float,
-):
-    """
-    ✅ '선택한 날짜만' 100% 보장 버전
-    1) 목록에서 후보 글 링크를 모음(속도 위해 최소 조건 적용)
-    2) 각 글 상세에 들어가서 실제 작성일을 읽음
-    3) target_date와 정확히 같은 글만 최종 수집
-    """
-    today = kst_today()
-    is_today = (target_date == today)
-    target_dot = target_date.strftime("%Y.%m.%d")
-    target_iso = target_date.strftime("%Y-%m-%d")
+# =========================
+# 진행/중지/디버그를 위한 "쪼개기(스텝 실행)" 상태머신
+# =========================
+def log(msg: str):
+    st.session_state.logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
-    driver = make_driver(headless=headless)
 
-    # 후보 / 최종
-    candidates = {}  # link -> base info(제목/작성자/목록표시)
-    collected = {}   # link -> final info
+def ensure_state():
+    ss = st.session_state
+    if "running" not in ss:
+        ss.running = False
+    if "phase" not in ss:
+        ss.phase = "idle"  # idle | collect | validate | done
+    if "driver" not in ss:
+        ss.driver = None
+    if "logs" not in ss:
+        ss.logs = []
+    if "candidates" not in ss:
+        ss.candidates = {}
+    if "collected" not in ss:
+        ss.collected = {}
+    if "page" not in ss:
+        ss.page = 1
+    if "no_match_pages" not in ss:
+        ss.no_match_pages = 0
+    if "validate_keys" not in ss:
+        ss.validate_keys = []
+    if "validate_i" not in ss:
+        ss.validate_i = 0
+    if "last_url" not in ss:
+        ss.last_url = ""
+    if "posts" not in ss:
+        ss.posts = []
 
-    no_match_pages = 0
 
+def reset_job():
+    ss = st.session_state
+    # 드라이버 정리
     try:
-        # -------------------------
-        # 1) 목록에서 후보 수집
-        # -------------------------
-        for page in range(1, int(max_pages) + 1):
-            driver.get(build_page_url(page))
-            wait_list_loaded(driver)
-            time.sleep(pause)
+        if ss.driver is not None:
+            ss.driver.quit()
+    except Exception:
+        pass
 
-            rows = driver.find_elements(By.CSS_SELECTOR, "tr")
+    ss.running = False
+    ss.phase = "idle"
+    ss.driver = None
+    ss.logs = []
+    ss.candidates = {}
+    ss.collected = {}
+    ss.page = 1
+    ss.no_match_pages = 0
+    ss.validate_keys = []
+    ss.validate_i = 0
+    ss.last_url = ""
+    ss.posts = []
+
+
+def start_job(target_date: date_cls, headless: bool, max_pages: int, stop_no_match_pages: int, pause: float):
+    reset_job()
+    ss = st.session_state
+    ss.target_date = target_date
+    ss.headless = headless
+    ss.max_pages = int(max_pages)
+    ss.stop_no_match_pages = int(stop_no_match_pages)
+    ss.pause = float(pause)
+
+    ss.driver = make_driver(headless=headless)
+    ss.phase = "collect"
+    ss.running = True
+    log(f"시작: target_date={target_date} headless={headless}")
+
+
+def stop_job():
+    ss = st.session_state
+    ss.running = False
+    log("중지(사용자 요청)")
+
+
+def finalize_job():
+    ss = st.session_state
+    df = pd.DataFrame(list(ss.collected.values()))
+    if not df.empty:
+        df = df.drop_duplicates(subset=["link"]).copy()
+        if "date_detail" in df.columns:
+            df = df.sort_values(by="date_detail", ascending=False)
+    ss.posts = df.to_dict("records")
+    ss.phase = "done"
+    ss.running = False
+    log(f"완료: 최종 {len(ss.posts)}개")
+
+
+def step_collect():
+    """
+    한 번 실행에서 '페이지 몇 개'만 처리 (UI 멈춤 방지)
+    """
+    ss = st.session_state
+    d = ss.driver
+
+    today = kst_today()
+    is_today = (ss.target_date == today)
+    target_dot = ss.target_date.strftime("%Y.%m.%d")
+    target_iso = ss.target_date.strftime("%Y-%m-%d")
+
+    # 이번 스텝에서 처리할 페이지 수 (고정)
+    pages_per_step = int(ss.pages_per_step)
+
+    processed = 0
+    while ss.page <= ss.max_pages and processed < pages_per_step and ss.running:
+        url = build_page_url(ss.page)
+        ss.last_url = url
+        log(f"[목록] page={ss.page}")
+        try:
+            d.get(url)
+            wait_list_loaded(d)
+            time.sleep(ss.pause)
+
+            rows = d.find_elements(By.CSS_SELECTOR, "tr")
             if len(rows) < 5:
-                rows = driver.find_elements(By.CSS_SELECTOR, "li") + rows
+                rows = d.find_elements(By.CSS_SELECTOR, "li") + rows
 
             page_candidate = 0
 
@@ -392,9 +447,7 @@ def collect_by_paging(
                     hhmm = extract_time_token(row_text)
                     dot = extract_date_token(row_text)
 
-                    # ✅ 후보 최소조건 (속도용)
-                    # - 오늘이면 "시간표시"가 있는 것만 후보
-                    # - 과거면 "YYYY.MM.DD"가 target과 같은 것만 후보
+                    # 후보 최소조건(속도용)
                     if is_today:
                         if not hhmm:
                             continue
@@ -406,10 +459,10 @@ def collect_by_paging(
                             continue
                         date_raw = dot
 
-                    if href not in candidates:
-                        candidates[href] = {
-                            "date": target_iso,           # 최종은 target_iso로 통일
-                            "date_raw": date_raw,         # 목록표시(참고용)
+                    if href not in ss.candidates:
+                        ss.candidates[href] = {
+                            "date": target_iso,
+                            "date_raw": date_raw,
                             "author": pick_row_author(row_text, title_raw),
                             "title": title_raw,
                             "title_norm": normalize_title(title_raw),
@@ -421,46 +474,62 @@ def collect_by_paging(
                     continue
 
             if page_candidate == 0:
-                no_match_pages += 1
+                ss.no_match_pages += 1
             else:
-                no_match_pages = 0
+                ss.no_match_pages = 0
 
-            if no_match_pages >= int(stop_no_match_pages):
+            # 조기 종료 조건
+            if ss.no_match_pages >= ss.stop_no_match_pages:
+                log("목록 조기 종료(연속 0페이지)")
+                ss.page = ss.max_pages + 1
                 break
 
-            time.sleep(pause)
+        except Exception as e:
+            log(f"목록 오류: {type(e).__name__}: {e}")
 
-        # -------------------------
-        # 2) 상세 들어가서 "진짜 작성일"로 최종 필터
-        # -------------------------
-        # (여기서부터는 다른 날짜 0개도 섞이면 안되니까 무조건 확인)
-        for idx, (href, base) in enumerate(candidates.items(), start=1):
-            dt = get_article_datetime_strict(driver, href, pause=pause)
+        ss.page += 1
+        processed += 1
 
-            # 작성일을 못 읽으면 안전하게 버림 (섞이는 것 방지)
-            if not dt:
-                continue
+    # 목록이 끝나면 validate로 전환
+    if ss.page > ss.max_pages or ss.no_match_pages >= ss.stop_no_match_pages:
+        ss.validate_keys = list(ss.candidates.keys())
+        ss.validate_i = 0
+        ss.phase = "validate"
+        log(f"상세 검증 단계로 전환: 후보 {len(ss.validate_keys)}개")
 
-            if dt.date() != target_date:
-                continue
 
-            out = dict(base)
-            out["date_detail"] = dt.strftime("%Y-%m-%d %H:%M")
-            collected[href] = out
+def step_validate():
+    """
+    한 번 실행에서 '게시글 몇 개'만 상세 검증
+    """
+    ss = st.session_state
+    d = ss.driver
 
-    finally:
+    per_step = int(ss.articles_per_step)
+
+    processed = 0
+    while ss.validate_i < len(ss.validate_keys) and processed < per_step and ss.running:
+        href = ss.validate_keys[ss.validate_i]
+        ss.last_url = href
+
         try:
-            driver.quit()
-        except Exception:
-            pass
+            dt = get_article_datetime_strict(d, href, pause=ss.pause)
 
-    df = pd.DataFrame(list(collected.values()))
-    if not df.empty:
-        df = df.drop_duplicates(subset=["link"]).copy()
-        # detail 시간 기준 정렬
-        if "date_detail" in df.columns:
-            df = df.sort_values(by="date_detail", ascending=False)
-    return df.to_dict("records")
+            # 못읽으면 버림 (섞임 방지)
+            if dt and dt.date() == ss.target_date:
+                base = ss.candidates[href]
+                out = dict(base)
+                out["date_detail"] = dt.strftime("%Y-%m-%d %H:%M")
+                ss.collected[href] = out
+
+        except Exception as e:
+            log(f"상세 오류: {type(e).__name__}: {e}")
+
+        ss.validate_i += 1
+        processed += 1
+
+    if ss.validate_i >= len(ss.validate_keys):
+        finalize_job()
 
 
 # =========================
@@ -483,10 +552,7 @@ def compute_keyword_groups(df: pd.DataFrame, min_count: int = 2):
     if df.empty:
         return pd.DataFrame(columns=["keyword", "count", "examples"])
 
-    tokens_list = []
-    for _, row in df.iterrows():
-        tokens_list.append(tokenize(row["title"]))
-
+    tokens_list = [tokenize(t) for t in df["title"].fillna("").astype(str).tolist()]
     inv = {}
     for idx, toks in enumerate(tokens_list):
         for tok in set(toks):
@@ -496,16 +562,10 @@ def compute_keyword_groups(df: pd.DataFrame, min_count: int = 2):
     for kw, idxs in inv.items():
         if len(idxs) >= min_count:
             ex = [df.iloc[i]["title"] for i in idxs[:3]]
-            rows.append({
-                "keyword": kw,
-                "count": len(idxs),
-                "examples": " | ".join(ex),
-            })
+            rows.append({"keyword": kw, "count": len(idxs), "examples": " | ".join(ex)})
 
     out = pd.DataFrame(rows)
-    if out.empty:
-        return out
-    return out.sort_values(by=["count", "keyword"], ascending=[False, True])
+    return out.sort_values(by=["count", "keyword"], ascending=[False, True]) if not out.empty else out
 
 
 def compute_ai_similar(df: pd.DataFrame, threshold: float = 0.78) -> pd.DataFrame:
@@ -548,10 +608,12 @@ def compute_ai_similar(df: pd.DataFrame, threshold: float = 0.78) -> pd.DataFram
 # =========================
 # UI
 # =========================
+ensure_state()
+
 with st.expander("설정", expanded=True):
     c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 1])
     with c1:
-        target_date = st.date_input("날짜 선택", value=kst_today())
+        target_date = st.date_input("날짜 선택(✅ 이 날짜만)", value=kst_today())
     with c2:
         headless = st.checkbox("헤드리스", value=True)
     with c3:
@@ -561,35 +623,110 @@ with st.expander("설정", expanded=True):
     with c5:
         pause = st.number_input("페이지 대기(초)", min_value=0.05, max_value=2.00, value=0.12, step=0.01)
 
-c6, c7 = st.columns([1, 1])
-with c6:
-    keyword_min_count = st.number_input("키워드 중복 최소 건수", min_value=2, max_value=20, value=2, step=1)
-with c7:
-    sim_threshold = st.slider("AI 유사도 기준", 0.50, 0.99, 0.78, 0.01)
+    c6, c7, c8 = st.columns([1, 1, 1])
+    with c6:
+        pages_per_step = st.number_input("한 번에 목록 페이지 처리", min_value=1, max_value=10, value=2, step=1)
+    with c7:
+        articles_per_step = st.number_input("한 번에 상세 글 검증", min_value=1, max_value=30, value=10, step=1)
+    with c8:
+        auto_run = st.checkbox("자동 진행(켜면 알아서 계속)", value=True)
+
+    st.session_state.pages_per_step = int(pages_per_step)
+    st.session_state.articles_per_step = int(articles_per_step)
 
 st.divider()
 
-if st.button("수집 시작", use_container_width=True):
-    st.session_state.posts = []
-    try:
-        posts = collect_by_paging(
-            target_date=target_date,
-            headless=headless,
-            max_pages=int(max_pages),
-            stop_no_match_pages=int(stop_no_match_pages),
-            pause=float(pause),
-        )
-        st.session_state.posts = posts
-        st.success(f"수집 완료: {len(posts)}개 (✅ 선택한 날짜만)")
-    except Exception:
-        st.error("수집 오류")
-        st.code(traceback.format_exc())
+btn1, btn2, btn3, btn4 = st.columns([1, 1, 1, 2])
+with btn1:
+    if st.button("▶ 시작", use_container_width=True):
+        try:
+            start_job(target_date, headless, int(max_pages), int(stop_no_match_pages), float(pause))
+            st.rerun()
+        except Exception:
+            st.error("시작 오류")
+            st.code(traceback.format_exc())
 
+with btn2:
+    if st.button("⏭ 진행(한 번)", use_container_width=True):
+        st.session_state.running = True
+        st.rerun()
+
+with btn3:
+    if st.button("⏹ 중지", use_container_width=True):
+        stop_job()
+        st.rerun()
+
+with btn4:
+    debug = st.checkbox("🪲 디버그 보기", value=False)
+
+# 진행 표시
+phase = st.session_state.phase
+running = st.session_state.running
+
+status = st.empty()
+pbar1 = st.progress(0)
+pbar2 = st.progress(0)
+
+# 진행률 계산
+if phase in ("collect", "validate", "done"):
+    # 1) 목록 단계 진행률
+    maxp = max(1, int(st.session_state.max_pages) if "max_pages" in st.session_state else int(max_pages))
+    curp = min(maxp, max(1, int(st.session_state.page)))
+    p1 = min(1.0, curp / maxp)
+    pbar1.progress(int(p1 * 100))
+
+    # 2) 상세 검증 단계 진행률
+    total = max(1, len(st.session_state.validate_keys))
+    done = min(total, int(st.session_state.validate_i))
+    p2 = min(1.0, done / total)
+    pbar2.progress(int(p2 * 100))
+
+if phase == "idle":
+    status.info("대기 중. ▶ 시작을 눌러줘.")
+elif phase == "collect":
+    status.info(
+        f"목록 수집 중… page={st.session_state.page-1} / 후보={len(st.session_state.candidates)} "
+        f"(마지막 URL: {st.session_state.last_url})"
+    )
+elif phase == "validate":
+    status.info(
+        f"상세 작성일 검증 중… {st.session_state.validate_i} / {len(st.session_state.validate_keys)} "
+        f"(통과={len(st.session_state.collected)})"
+    )
+elif phase == "done":
+    status.success(f"완료! 선택한 날짜 글만 {len(st.session_state.posts)}개")
+
+# 디버그 로그
+if debug:
+    st.caption("DEBUG LOG")
+    st.code("\n".join(st.session_state.logs[-200:]) if st.session_state.logs else "(로그 없음)")
+    st.caption(f"last_url = {st.session_state.last_url}")
+
+# 실제 작업 스텝 실행
+if running and phase in ("collect", "validate"):
+    try:
+        if phase == "collect":
+            step_collect()
+        elif phase == "validate":
+            step_validate()
+    except Exception as e:
+        log(f"치명 오류: {type(e).__name__}: {e}")
+        st.session_state.running = False
+
+    # 자동 진행이면 계속 rerun
+    if auto_run and st.session_state.running and st.session_state.phase in ("collect", "validate"):
+        time.sleep(0.15)  # UI 숨 쉴 틈
+        st.rerun()
+
+# 결과 표시
 df = (
     pd.DataFrame(st.session_state.posts)
-    if "posts" in st.session_state and st.session_state.posts
+    if st.session_state.posts
     else pd.DataFrame(columns=["date", "date_raw", "date_detail", "author", "title", "title_norm", "link"])
 )
+
+keyword_min_count = st.number_input("키워드 중복 최소 건수", min_value=2, max_value=20, value=2, step=1)
+sim_threshold = st.slider("AI 유사도 기준", 0.50, 0.99, 0.78, 0.01)
 
 author_dups = compute_author_dups(df)
 exact_dups = compute_exact_dups(df)
@@ -602,25 +739,13 @@ with tab1:
     st.dataframe(df, use_container_width=True)
 
 with tab2:
-    if author_dups.empty:
-        st.info("해당 없음")
-    else:
-        st.dataframe(author_dups, use_container_width=True)
+    st.dataframe(author_dups if not author_dups.empty else pd.DataFrame(), use_container_width=True)
 
 with tab3:
-    if exact_dups.empty:
-        st.info("해당 없음")
-    else:
-        st.dataframe(exact_dups, use_container_width=True)
+    st.dataframe(exact_dups if not exact_dups.empty else pd.DataFrame(), use_container_width=True)
 
 with tab4:
-    if keyword_groups.empty:
-        st.info("해당 없음")
-    else:
-        st.dataframe(keyword_groups, use_container_width=True)
+    st.dataframe(keyword_groups if not keyword_groups.empty else pd.DataFrame(), use_container_width=True)
 
 with tab5:
-    if ai_similar.empty:
-        st.info("해당 없음")
-    else:
-        st.dataframe(ai_similar, use_container_width=True)
+    st.dataframe(ai_similar if not ai_similar.empty else pd.DataFrame(), use_container_width=True)
